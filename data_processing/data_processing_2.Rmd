@@ -1,0 +1,146 @@
+## Data Processing Part 2
+
+### Import packages
+```{r import-packages, message=FALSE}
+library(readr)
+library(dplyr)
+library(lubridate)
+library(here) 
+library(tidyr)
+library(ggplot2)
+```
+
+### 1. Join with USREC data (recession indicator)
+Join the 3 transformed CSV files on recession indicator values. 1 indicates a recession month, while 0 indicates non-recession month.
+
+```{r merge-usrec, message=FALSE}
+
+# Parse the date format "1959-01-01", setting the 1st of the month as floor in case
+parse_month <- function(x) {
+  floor_date(as.Date(parse_date_time(x, orders = "Ymd")), "month")
+}
+
+# Load USREC and standardise data types
+usrec <- read_csv(here("data", "raw", "USREC.csv"), show_col_types = FALSE) %>%
+  rename(date = 1) %>%
+  transmute(month = parse_month(date), USREC = as.integer(USREC))
+
+# Join USREC on FRED MD transformed datasets
+add_usrec <- function(file) {
+  df <- read_csv(here("data", "processed", file), show_col_types = FALSE)
+  date_col <- "sasdate"
+
+  out <- df %>%
+    mutate(month = parse_month(.data[[date_col]])) %>%
+    left_join(usrec, by = "month") %>%
+    select(-month)
+
+  n_na <- sum(is.na(out$USREC))
+  if (n_na > 0) warning(file, ": ", n_na, " rows have no matching USREC value")
+
+  write_csv(out, here("data", "processed", sub("\\.csv$", "_usrec.csv", file)))
+  out
+}
+
+files <- c("fred_md_macro_clean.csv",
+           "fred_md_macro_financial_clean.csv")
+
+merged <- setNames(lapply(files, add_usrec), files)
+
+# Quick check: row counts and how many months are recessions
+sapply(merged, function(d) c(rows = nrow(d), recession_months = sum(d$USREC, na.rm = TRUE)))
+```
+
+### 2. Missing data heatmap and table
+
+This heatmap shows the availability of each predictor's data with time. It aims to give a board overview of data availability trends and continuity, to ensure that a sensible cut off can be made to handle missing values.
+
+```{r missing-heatmap, fig.width=10, fig.height=6}
+
+df <- read_csv(here("data", "processed", "fred_md_macro_financial_clean_usrec.csv"),
+               show_col_types = FALSE)
+
+predictors <- setdiff(names(df), c("sasdate", "USREC"))
+
+miss_long <- df %>%
+  mutate(yr = year(sasdate) + (month(sasdate) - 1) / 12) %>%  #change months to year + decimal
+  select(yr, all_of(predictors)) %>%
+  pivot_longer(-yr, names_to = "variable", values_to = "value") %>%
+  mutate(status   = if_else(is.na(value), "Missing", "Available"),
+         variable = factor(variable, levels = predictors))   # keep file's column order
+
+cutoff_yr <- 1962   # reference line
+
+ggplot(miss_long, aes(x = variable, y = yr, fill = status)) +
+  geom_raster() +
+  geom_hline(yintercept = cutoff_yr, colour = "#E63946", linewidth = 0.8) +
+  scale_fill_manual(values = c(Available = "#1D3557", Missing = "#F4A261")) +
+  scale_y_reverse(breaks = seq(1960, 2025, by = 5), expand = c(0, 0)) +
+  labs(title = "Data Availability by Predictor",
+       x = "Predictors", y = NULL, fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x  = element_blank(),
+        panel.grid   = element_blank(),
+        legend.position = "top",
+        plot.title   = element_text(face = "bold", hjust = 0.5))
+```
+
+From the heatmap, most predictors are available in continuous chunks, from a certain date onwards. Some predictors are missing large chunks of data, and shall be removed from the analysis.
+
+
+```{r missing-predictors, message=FALSE}
+missing_summary <- tibble(
+  variable    = predictors,
+  n_missing   = sapply(predictors, function(v) sum(is.na(df[[v]]))),
+  pct_missing = round(n_missing / nrow(df) * 100, 1),
+  first_valid = sapply(predictors, function(v) as.character(min(df$sasdate[!is.na(df[[v]])]))),
+  last_valid  = sapply(predictors, function(v) as.character(max(df$sasdate[!is.na(df[[v]])])))
+) %>%
+  filter(n_missing > 0) %>%
+  arrange(desc(n_missing))
+
+knitr::kable(missing_summary,
+             col.names = c("Variable", "Months missing", "% missing", "First valid", "Last valid"),
+             align = "lrrcc")
+```
+
+Based on this summary, a sensible cut off point is from July 1962 onwards, where VIXCLSx is available. The first 4 predictors in the list (ACOGNO, UMCSENTx, TWEXAFEGSMTHx, ANDENOx) will be removed due to large amounts of missing values.
+
+
+### 3. Drop relevant predictors and set cut off month
+
+```{r trim-sample}
+drop_vars  <- c("ACOGNO", "UMCSENTx", "TWEXAFEGSMTHx", "ANDENOx")
+start_date <- as.Date("1962-07-01")
+
+files_usrec <- sub("\\.csv$", "_usrec.csv", files)
+
+# Load the merged files and drop the 4 predictors (any_of skips ones a file doesn't have)
+dfs <- setNames(lapply(files_usrec, function(f) {
+  read_csv(here("data", "processed", f), show_col_types = FALSE) %>%
+    select(-any_of(drop_vars))
+}), files_usrec)
+
+# End date: the latest month where every remaining predictor, in every file, has data
+end_date <- as.Date(min(sapply(dfs, function(d) {
+  preds <- setdiff(names(d), c("sasdate", "USREC"))
+  min(sapply(preds, function(v) max(d$sasdate[!is.na(d[[v]])])))
+})), origin = "1970-01-01")
+
+# Trim all three files to the same window
+trimmed <- lapply(dfs, function(d) filter(d, sasdate >= start_date, sasdate <= end_date))
+
+# Save
+for (f in names(trimmed)) {
+  write_csv(trimmed[[f]], here("data", "processed", sub("_usrec\\.csv$", "_final.csv", f)))
+}
+
+# Check
+end_date
+sapply(trimmed, function(d) c(
+  rows             = nrow(d),
+  predictors       = ncol(d) - 2,
+  recession_months = sum(d$USREC),
+  missing_cells    = sum(is.na(d))
+))
+```
