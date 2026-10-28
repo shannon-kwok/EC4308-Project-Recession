@@ -1,0 +1,81 @@
+---
+title: "LASSO"
+author: "Tan Sze Ping"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(readr)
+library(hdm)
+library(pROC)
+library(knitr)
+
+```
+
+# 2. Load Data
+
+```{r}
+macro <- read_csv("../data/processed/fred_md_macro_clean_final.csv", show_col_types = FALSE)
+
+macro_fin <- read_csv("../data/processed/fred_md_macro_financial_clean_final.csv", show_col_types = FALSE)
+
+dim(macro)
+dim(macro_fin)
+#names(macro)
+#names(macro_fin)
+
+# Check if recession indicator exists
+"USREC" %in% names(macro)
+"USREC" %in% names(macro_fin)
+
+# Check date ranges
+range(macro$sasdate)
+range(macro_fin$sasdate)
+
+# Check missing values
+sum(is.na(macro))
+sum(is.na(macro_fin))
+```
+#3. EDA; Checking of recessions (can move to seperate Rmd downstream)
+```{r}
+recession_data <- macro_fin %>%
+  select(sasdate, USREC) %>%
+  arrange(sasdate) %>%
+  mutate(
+    recession_start = USREC == 1 & lag(USREC, default = 0) == 0,
+    recession_id = cumsum(recession_start)
+  ) %>%
+  filter(USREC == 1) %>%
+  group_by(recession_id) %>%
+  summarise(
+    start_date = min(sasdate),
+    end_date = max(sasdate),
+    duration_months = n(),
+    .groups = "drop"
+  ) %>%
+  select(-recession_id)
+
+print(recession_data)
+
+# recommended cutoff, referenced from research papers
+cutoff <- as.Date("1986-01-01")
+
+recession_data %>%
+  mutate(
+    sample = case_when(
+      end_date < cutoff ~ "Training",
+      start_date >= cutoff ~ "Testing",
+      TRUE ~ "Crosses cutoff"
+    )
+  ) %>%
+  select(start_date, end_date, duration_months, sample)
+```
+
