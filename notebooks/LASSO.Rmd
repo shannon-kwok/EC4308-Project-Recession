@@ -233,7 +233,7 @@ unchanged <- all(
 check_imputation(macro, macro_model)
 check_imputation(macro_fin, macro_fin_model)
 ```
-#8. LASSO model (macro only predictors at 3 month horizon)
+#8. LASSO model (macro only predictors at 3 month horizon trial (can remove after reusable function is done))
 
 ```{r}
 # training data : exclude rows whose 3-months outcomes extend beyond Dec 1985
@@ -273,7 +273,7 @@ summary(p_post)
 range(p_lasso)
 range(p_post)
 ```
-
+reusable function - have to think about the announcement delays from NBER, as mentioned by prof, this assumption may introduce lookahead bias... can consider incorporating announcement delays into model specification (18 months following Davig and Hall),, so like restruct training observations to those at least h + 18 months before forecast origin
 ```{r}
 fit_lasso <- function(train_data, horizon, post=FALSE) {
   target <- paste0("Y_", horizon)
@@ -315,6 +315,80 @@ post_lasso_3m <- fit_lasso(
   post = TRUE
 )
 
+forecast_lasso <- function(df, horizon, post=FALSE, test_start = as.Date("1986-01-01")) {
+  target <- paste0("Y_", horizon)
+  
+  # exclude non-predictor columns
+  predictor_cols <- setdiff(
+    names(df),
+    c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+  )
+  df <- df %>% arrange(sasdate)
+  
+  # test observations with known outcomes
+  test_indices <- which(
+    df$sasdate >= test_start & !is.na(df[[target]])
+  )
+  results <- vector("list", length(test_indices))
+  
+  for (j in seq_along(test_indices)) {
+    i <- test_indices[j]
+    # latest training observation with completed target window
+    train_end_idx <- i-horizon-1
+    if (train_end_idx < 1) next
+    
+    # expanding training window
+    train_data <- df[seq_len(train_end_idx),,drop=FALSE] %>%
+      filter(!is.na(.data[[target]]))
+    
+    # check training sample
+    if (
+      nrow(train_data) < 50 ||
+      length(unique(train_data[[target]])) < 2) next
+    
+    # fit model
+    model <- fit_lasso(
+      train_data = train_data,
+      horizon = horizon,
+      post = post
+    )
+    
+    # predict using current month's indicators
+    x_test <- as.matrix(
+      df[c(i,i), predictor_cols, drop = FALSE]
+    )
+    probs <- as.numeric(predict(model, newdata = x_test, type = "response"))
+    stopifnot(length(probs) == 2)
+    prob <- probs[1]
+    results[[j]] <- data.frame(
+      sasdate = df$sasdate[i],
+      horizon=horizon,
+      post=post,
+      actual = df[[target]][i],
+      predicted_prob = prob
+    )
+  }
+  bind_rows(results)
+}
+
+test_forecast <- forecast_lasso(
+  df = macro_model,
+  horizon = 3,
+  post = FALSE
+)
+
+head(test_forecast)
+
+nrow(test_forecast)
+length(unique(test_forecast$sasdate))
+
+summary(test_forecast$predicted_prob)
+range(test_forecast$predicted_prob)
+
+test_forecast %>%
+  filter(predicted_prob > 0.99) %>%
+  select(sasdate, actual, predicted_prob)
 
 ```
+
 
