@@ -17,6 +17,8 @@ library(readr)
 library(hdm)
 library(pROC)
 library(knitr)
+library(tidyr)
+set.seed(1213)
 
 ```
 
@@ -77,5 +79,242 @@ recession_data %>%
     )
   ) %>%
   select(start_date, end_date, duration_months, sample)
+```
+
+#4. Target Construction
+```{r}
+
+create_targets <- function(df) {
+  df <- df %>%
+    arrange(sasdate)
+  for (h in c(3, 6, 12)) {
+    future_recession <- sapply(
+      seq_len(nrow(df)),
+      function(i) {
+        future_rows <- (i + 1):(i + h)
+        # Exclude observations without complete future data
+        if (max(future_rows) > nrow(df)) {
+          return(NA_integer_)
+        }
+        future_values <- df$USREC[future_rows]
+        # Handle missing recession indicators
+        if (any(is.na(future_values))) {
+          return(NA_integer_)
+        }
+
+        # 1 if any future month is recessionary
+        as.integer(any(future_values == 1))
+      }
+    )
+    df[[paste0("Y_", h)]] <- future_recession
+  }
+  return(df)
+}
+
+
+macro <- create_targets(macro)
+macro_fin <- create_targets(macro_fin)
+
+#logic check
+macro %>%
+  select(sasdate, USREC, Y_3, Y_6, Y_12) %>%
+  filter(
+    sasdate >= as.Date("2007-01-01"),
+    sasdate <= as.Date("2008-06-01")
+  ) %>%
+  print(n = Inf)
+```
+
+#5. Train-test split
+```{r}
+test_start <- as.Date("1986-01-01")
+
+# Label training and testing periods
+macro <- macro %>%
+  mutate(sample = if_else(sasdate < test_start, "train", "test"))
+
+macro_fin <- macro_fin %>%
+  mutate(sample = if_else(sasdate < test_start, "train", "test"))
+
+table(macro$sample)
+table(macro_fin$sample)
+
+# check correctness of split
+macro %>%
+  group_by(sample) %>%
+  summarise(start_date = min(sasdate), end_date = max(sasdate), observations = n(), recession_months = sum(USREC == 1, na.rm=TRUE), .groups = "drop")
+
+macro_fin %>%
+  group_by(sample) %>%
+  summarise(start_date = min(sasdate), end_date = max(sasdate), observations = n(), recession_months = sum(USREC == 1, na.rm=TRUE), .groups = "drop")
+```
+
+#6. Check for missing values in predictors
+```{r}
+# identify columns with missing values
+macro %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  tidyr::pivot_longer(everything(), names_to = "variable", values_to = "missing_count") %>%
+  filter(missing_count > 0)
+
+macro_fin %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  tidyr::pivot_longer(everything(), names_to = "variable", values_to = "missing_count") %>%
+  filter(missing_count > 0)
+
+# where does the missing values occur
+predictor_cols <- setdiff(
+  names(macro),
+  c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+)
+
+macro %>%
+  filter(if_any(all_of(predictor_cols), is.na)) %>%
+  select(sasdate, all_of(predictor_cols)) %>%
+  mutate(
+    missing_count = rowSums(is.na(across(all_of(predictor_cols))))
+  ) %>%
+  select(sasdate, missing_count)
+```
+#7. Missing value treatment (basic forward imputation for simplicity, can consider others... check if missing value is due to missingness of raw FRED data)
+
+```{r}
+forward_fill <- function(df) {
+  predictor_cols <- setdiff(
+    names(df),
+    c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+  )
+  df %>%
+    arrange(sasdate) %>%
+    fill(all_of(predictor_cols), .direction = "down")
+}
+
+macro_model <- forward_fill(macro)
+macro_fin_model <- forward_fill(macro_fin)
+
+# verify correctness of forward fill
+
+# anymore na values in dataset
+predictor_cols_macro <- setdiff(
+  names(macro_model),
+  c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+)
+
+predictor_cols_fin <- setdiff(
+  names(macro_fin_model),
+  c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+)
+
+sum(is.na(macro_model[predictor_cols_macro]))
+sum(is.na(macro_fin_model[predictor_cols_fin]))
+
+# check that existing values were not modified, only missing values are imputed
+
+check_imputation <- function(original, imputed) {
+
+predictor_cols <- setdiff(
+    names(original),
+    c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+  )
+
+unchanged <- all(
+    sapply(predictor_cols, function(col) {
+      idx <- !is.na(original[[col]])
+      identical(
+        original[[col]][idx],
+        imputed[[col]][idx]
+      )
+    })
+  )
+  return(unchanged)
+}
+
+
+check_imputation(macro, macro_model)
+check_imputation(macro_fin, macro_fin_model)
+```
+#8. LASSO model (macro only predictors at 3 month horizon)
+
+```{r}
+# training data : exclude rows whose 3-months outcomes extend beyond Dec 1985
+
+train_data <- macro_model %>%
+  filter(sasdate < as.Date("1986-01-01"), sasdate <= as.Date("1985-09-01"), !is.na(Y_3))
+
+X_train <- as.matrix(train_data[, predictor_cols])
+y_train <- train_data$Y_3
+
+dim(X_train)
+table(y_train)
+
+# Estimate standard lasso
+lasso_3m <- rlassologit(x=X_train, y=y_train, post=FALSE)
+
+# Estimate post lasso
+post_lasso_3m <- rlassologit(x=X_train, y=y_train, post=TRUE)
+
+summary(lasso_3m)
+summary(post_lasso_3m)
+coef(lasso_3m)
+coef(post_lasso_3m)
+
+# training fitted probabilities
+p_lasso <- as.numeric(
+  predict(lasso_3m, newdata = X_train, type = "response")
+)
+
+p_post <- as.numeric(
+  predict(post_lasso_3m, newdata = X_train, type = "response")
+)
+
+summary(p_lasso)
+summary(p_post)
+
+range(p_lasso)
+range(p_post)
+```
+
+```{r}
+fit_lasso <- function(train_data, horizon, post=FALSE) {
+  target <- paste0("Y_", horizon)
+  # exclude variables that should not be predictors
+  predictor_cols <- setdiff(
+    names(train_data),
+    c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+  )
+  
+  # prepare x and y
+  x_train <- as.matrix(train_data[,predictor_cols])
+  y_train <- train_data[[target]]
+  
+  # estimate model
+  model <- rlassologit(x=x_train, y=y_train, post=post)
+  return(model)
+}
+
+train_3m <- macro_model %>%
+  filter(
+    sasdate <= as.Date("1985-09-01"),
+    !is.na(Y_3)
+  )
+
+train_3m <- macro_model %>%
+  filter(sasdate <= as.Date("1985-09-01"), !is.na(Y_3))
+
+# Standard LASSO
+lasso_3m <- fit_lasso(
+  train_data = train_3m,
+  horizon = 3,
+  post = FALSE
+)
+
+# Post-LASSO
+post_lasso_3m <- fit_lasso(
+  train_data = train_3m,
+  horizon = 3,
+  post = TRUE
+)
+
+
 ```
 
