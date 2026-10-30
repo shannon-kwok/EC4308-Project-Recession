@@ -9,9 +9,11 @@
 <meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
 
 
+<meta name="author" content="Shannon Kwok" />
 
+<meta name="date" content="2026-10-30" />
 
-<title>data_processing_2.knit</title>
+<title>Data Processing Part 2</title>
 
 <script>// Pandoc 2.9 adds attributes on both header and div. We remove the former (to
 // be compatible with the behavior of Pandoc < 2.8).
@@ -348,12 +350,13 @@ display: none;
 
 
 
+<h1 class="title toc-ignore">Data Processing Part 2</h1>
+<h4 class="author">Shannon Kwok</h4>
+<h4 class="date">2026-10-30</h4>
 
 </div>
 
 
-<div id="data-processing-part-2" class="section level2">
-<h2>Data Processing Part 2</h2>
 <div id="import-packages" class="section level3">
 <h3>Import packages</h3>
 <pre class="r"><code>library(readr)
@@ -362,7 +365,6 @@ library(lubridate)
 library(here) 
 library(tidyr)
 library(ggplot2)</code></pre>
-<pre><code>## Warning: package &#39;ggplot2&#39; was built under R version 4.4.3</code></pre>
 </div>
 <div id="join-with-usrec-data-recession-indicator" class="section level3">
 <h3>1. Join with USREC data (recession indicator)</h3>
@@ -1304,6 +1306,282 @@ end_date</code></pre>
 ## recession_months                                      85
 ## missing_cells                                         55</code></pre>
 </div>
+<div id="fill-remaining-missing-values" class="section level3">
+<h3>4. Fill remaining missing values</h3>
+<p>The remaining missing values are filled the the most recent observed
+value.</p>
+<pre class="r"><code># Record which cells are being filled
+filled_cells &lt;- bind_rows(lapply(names(trimmed), function(f) {
+  trimmed[[f]] %&gt;%
+    pivot_longer(-c(sasdate, USREC), names_to = &quot;variable&quot;) %&gt;%
+    filter(is.na(value)) %&gt;%
+    group_by(variable) %&gt;%
+    summarise(months = paste(format(sasdate, &quot;%Y-%m&quot;), collapse = &quot;, &quot;), .groups = &quot;drop&quot;) %&gt;%
+    mutate(file = f, .before = 1)
+}))
+knitr::kable(filled_cells, col.names = c(&quot;File&quot;, &quot;Variable&quot;, &quot;Months filled&quot;))</code></pre>
+<table>
+<colgroup>
+<col width="50%" />
+<col width="17%" />
+<col width="32%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th align="left">File</th>
+<th align="left">Variable</th>
+<th align="left">Months filled</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">CE16OV</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">CLF16OV</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">CPIAPPSL</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">CPIAUCSL</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">CPIMEDSL</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">CPITRNSL</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">CPIULFSL</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">CUSR0000SA0L2</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">CUSR0000SA0L5</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">CUSR0000SAC</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">CUSR0000SAD</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">CUSR0000SAS</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">HWIURATIO</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">M2REAL</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">UEMP15OV</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">UEMP15T26</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">UEMP27OV</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">UEMP5TO14</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">UEMPLT5</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">UEMPMEAN</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_clean_usrec.csv</td>
+<td align="left">UNRATE</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">CE16OV</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">CLF16OV</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">COMPAPFFx</td>
+<td align="left">2020-04</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">CP3Mx</td>
+<td align="left">2020-04, 2020-05</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">CPIAPPSL</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">CPIAUCSL</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">CPIMEDSL</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">CPITRNSL</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">CPIULFSL</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">CUSR0000SA0L2</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">CUSR0000SA0L5</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">CUSR0000SAC</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">CUSR0000SAD</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">CUSR0000SAS</td>
+<td align="left">2025-10, 2025-11, 2025-12</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">HWIURATIO</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">M2REAL</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">UEMP15OV</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">UEMP15T26</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">UEMP27OV</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">UEMP5TO14</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">UEMPLT5</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="odd">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">UEMPMEAN</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+<tr class="even">
+<td align="left">fred_md_macro_financial_clean_usrec.csv</td>
+<td align="left">UNRATE</td>
+<td align="left">2025-10, 2025-11</td>
+</tr>
+</tbody>
+</table>
+<pre class="r"><code># Last observation carried forward (past values only)
+filled &lt;- lapply(trimmed, function(d) {
+  d %&gt;%
+    arrange(sasdate) %&gt;%
+    fill(-c(sasdate, USREC), .direction = &quot;down&quot;)
+})
+
+# Save (overwrites the _final files from step 3)
+for (f in names(filled)) {
+  write_csv(filled[[f]], here(&quot;data&quot;, &quot;processed&quot;, sub(&quot;_usrec\\.csv$&quot;, &quot;_final.csv&quot;, f)))
+}
+
+# Check: no missing cells, and no gaps in the monthly sequence
+sapply(filled, function(d) c(
+  rows               = nrow(d),
+  missing_cells      = sum(is.na(d)),
+  consecutive_months = all(diff(d$sasdate) %in% 28:31)
+))</code></pre>
+<pre><code>##                    fred_md_macro_clean_usrec.csv
+## rows                                         768
+## missing_cells                                  0
+## consecutive_months                             1
+##                    fred_md_macro_financial_clean_usrec.csv
+## rows                                                   768
+## missing_cells                                            0
+## consecutive_months                                       1</code></pre>
 </div>
 
 
