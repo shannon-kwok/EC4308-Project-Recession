@@ -233,46 +233,7 @@ unchanged <- all(
 check_imputation(macro, macro_model)
 check_imputation(macro_fin, macro_fin_model)
 ```
-#8. LASSO model (macro only predictors at 3 month horizon trial (can remove after reusable function is done))
-
-```{r}
-# training data : exclude rows whose 3-months outcomes extend beyond Dec 1985
-
-train_data <- macro_model %>%
-  filter(sasdate < as.Date("1986-01-01"), sasdate <= as.Date("1985-09-01"), !is.na(Y_3))
-
-X_train <- as.matrix(train_data[, predictor_cols])
-y_train <- train_data$Y_3
-
-dim(X_train)
-table(y_train)
-
-# Estimate standard lasso
-lasso_3m <- rlassologit(x=X_train, y=y_train, post=FALSE)
-
-# Estimate post lasso
-post_lasso_3m <- rlassologit(x=X_train, y=y_train, post=TRUE)
-
-summary(lasso_3m)
-summary(post_lasso_3m)
-coef(lasso_3m)
-coef(post_lasso_3m)
-
-# training fitted probabilities
-p_lasso <- as.numeric(
-  predict(lasso_3m, newdata = X_train, type = "response")
-)
-
-p_post <- as.numeric(
-  predict(post_lasso_3m, newdata = X_train, type = "response")
-)
-
-summary(p_lasso)
-summary(p_post)
-
-range(p_lasso)
-range(p_post)
-```
+#8. LASSO model 
 reusable function - have to think about the announcement delays from NBER, as mentioned by prof, this assumption may introduce lookahead bias... can consider incorporating announcement delays into model specification (18 months following Davig and Hall),, so like restruct training observations to those at least h + 18 months before forecast origin
 ```{r}
 fit_lasso <- function(train_data, horizon, post=FALSE) {
@@ -385,10 +346,122 @@ length(unique(test_forecast$sasdate))
 summary(test_forecast$predicted_prob)
 range(test_forecast$predicted_prob)
 
-test_forecast %>%
-  filter(predicted_prob > 0.99) %>%
-  select(sasdate, actual, predicted_prob)
-
 ```
 
+#9. Out of Sample forecasting
+
+```{r}
+datasets <- list(Macro = macro_model, Macro_Financial = macro_fin_model)
+horizons <- c(3,6,12)
+post_options <- c(FALSE,TRUE)
+
+# store predictions
+all_forecasts <- list()
+
+for (dataset_name in names(datasets)) {
+  for (h in horizons) {
+    for (post_option in post_options) {
+     model_name <- ifelse(post_option, "Post-LASSO", "LASSO")
+     cat("Running:", dataset_name, h, model_name, "\n")
+     result <- forecast_lasso(
+       df = datasets[[dataset_name]],
+       horizon = h,
+       post = post_option
+     )
+     result$dataset <- dataset_name
+     result$model <- model_name
+     key <- paste(dataset_name, h, model_name, sep = "_")
+     all_forecasts[[key]] <- result
+    }
+  }
+}
+
+# combine results
+forecast_results <- bind_rows(all_forecasts)
+head(forecast_results)
+
+```
+```{r}
+# verify that all forecast configurations ran successfully
+
+forecast_results %>%
+  group_by(dataset, horizon, model) %>%
+  summarise(n_forecasts = n(),
+            unique_dates = n_distinct(sasdate),
+            min_prob = min(predicted_prob),
+            max_prob = max(predicted_prob),
+            .groups="drop")
+```
+
+```{r}
+# check where extreme predictions of 1 occur
+forecast_results %>%
+  filter(predicted_prob > 0.9999) %>%
+  group_by(dataset, horizon, model) %>%
+  summarise(
+    n_extreme = n(),
+    dates = paste(as.character(sasdate), collapse = ", "),
+    .groups = "drop"
+  )
+
+# check correctness of extreme predictinos of 1
+
+forecast_results %>%
+  filter(predicted_prob > 0.9999) %>%
+  group_by(dataset, horizon, model) %>%
+  summarise(
+    n_extreme = n(),
+    correct = sum(actual == 1),
+    incorrect = sum(actual == 0),
+    .groups = "drop"
+  )
+```
+## POINT TO NOTE (TO ADD IN REPORT) Across all LASSO specifications and forecast horizons, the models produce an extremely confident false positive in April 2020. This may reflect the exceptional nature of the COVID-19 recession, which lasted only two months. Historically, severe deteriorations in macroeconomic conditions are associated with more persistent recessions, potentially leading the models to overestimate future recession risk. Furthermore, because the target variable captures recession occurrence strictly after the forecast-origin month, April 2020 is classified as a non-recession outcome despite being a recessionary month itself. This illustrates the sensitivity of recession forecasting to both unusual economic shocks and the definition of the forecasting target.
+
+# 10. Evaluation of results
+
+```{r}
+evaluate_forecasts <- function(df, threshold = 0.5) {
+  actual <- df$actual
+  prob <- df$predicted_prob
+  
+  # convert probabilities into binary predictions
+  predicted <- as.integer(prob >= threshold)
+  
+  # confusion matrix components
+  TP <- sum(predicted == 1 & actual == 1)
+  TN <- sum(predicted == 0 & actual == 0)
+  FP <- sum(predicted == 1 & actual == 0)
+  FN <- sum(predicted == 0 & actual == 1)
+  
+  # classification metrics
+  precision <- ifelse(TP+FP==0,0, TP/(TP+FP))
+  recall <- ifelse(TP+FN==0, NA_real_, TP/(TP+FN))
+  specificity <- ifelse(TN+FP==0, NA_real_, TN/(TN+FP))
+  f1 <- ifelse(precision+recall==0,0,2*precision*recall/(precision+recall))
+  balanced_accuracy <- (recall+specificity)/2
+  
+  # probability based evaluation
+  brier <- mean((actual-prob)^2)
+  
+  #ROC-AUC
+  auc_value <- as.numeric(auc(roc(actual,prob,quiet=TRUE)))
+  data.frame(AUC = auc_value, F1 = f1, Balanced_Accuracy = balanced_accuracy, Brier = brier)
+}
+```
+
+```{r}
+evaluation_results <- forecast_results %>%
+  group_by(dataset, horizon, model) %>%
+  group_modify(~evaluate_forecasts(.x)) %>%
+  ungroup()
+
+print(evaluation_results, n=Inf)
+```
+
+Comparison between Macroeconomic indicators model and Financial + Macroeconomic variables model
+
+```{r}
+
+```
 
