@@ -1,7 +1,16 @@
-## Data Processing Part 2
+---
+title: "Data Processing Part 2"
+author: "Shannon Kwok"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
 
 ### Import packages
-```{r import-packages, message=FALSE}
+```{r import-packages, message=FALSE, warning=FALSE}
 library(readr)
 library(dplyr)
 library(lubridate)
@@ -142,5 +151,41 @@ sapply(trimmed, function(d) c(
   predictors       = ncol(d) - 2,
   recession_months = sum(d$USREC),
   missing_cells    = sum(is.na(d))
+))
+```
+
+### 4. Fill remaining missing values
+
+The remaining missing values are filled the the most recent observed value.
+
+```{r fill-missing}
+# Record which cells are being filled
+filled_cells <- bind_rows(lapply(names(trimmed), function(f) {
+  trimmed[[f]] %>%
+    pivot_longer(-c(sasdate, USREC), names_to = "variable") %>%
+    filter(is.na(value)) %>%
+    group_by(variable) %>%
+    summarise(months = paste(format(sasdate, "%Y-%m"), collapse = ", "), .groups = "drop") %>%
+    mutate(file = f, .before = 1)
+}))
+knitr::kable(filled_cells, col.names = c("File", "Variable", "Months filled"))
+
+# Last observation carried forward (past values only)
+filled <- lapply(trimmed, function(d) {
+  d %>%
+    arrange(sasdate) %>%
+    fill(-c(sasdate, USREC), .direction = "down")
+})
+
+# Save (overwrites the _final files from step 3)
+for (f in names(filled)) {
+  write_csv(filled[[f]], here("data", "processed", sub("_usrec\\.csv$", "_final.csv", f)))
+}
+
+# Check: no missing cells, and no gaps in the monthly sequence
+sapply(filled, function(d) c(
+  rows               = nrow(d),
+  missing_cells      = sum(is.na(d)),
+  consecutive_months = all(diff(d$sasdate) %in% 28:31)
 ))
 ```
