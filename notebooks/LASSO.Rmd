@@ -46,6 +46,7 @@ range(macro_fin$sasdate)
 sum(is.na(macro))
 sum(is.na(macro_fin))
 ```
+
 #3. EDA; Checking of recessions (can move to seperate Rmd downstream)
 ```{r}
 recession_data <- macro_fin %>%
@@ -176,64 +177,8 @@ macro %>%
   ) %>%
   select(sasdate, missing_count)
 ```
-#7. Missing value treatment (basic forward imputation for simplicity, can consider others... check if missing value is due to missingness of raw FRED data)
 
-```{r}
-forward_fill <- function(df) {
-  predictor_cols <- setdiff(
-    names(df),
-    c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
-  )
-  df %>%
-    arrange(sasdate) %>%
-    fill(all_of(predictor_cols), .direction = "down")
-}
-
-macro_model <- forward_fill(macro)
-macro_fin_model <- forward_fill(macro_fin)
-
-# verify correctness of forward fill
-
-# anymore na values in dataset
-predictor_cols_macro <- setdiff(
-  names(macro_model),
-  c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
-)
-
-predictor_cols_fin <- setdiff(
-  names(macro_fin_model),
-  c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
-)
-
-sum(is.na(macro_model[predictor_cols_macro]))
-sum(is.na(macro_fin_model[predictor_cols_fin]))
-
-# check that existing values were not modified, only missing values are imputed
-
-check_imputation <- function(original, imputed) {
-
-predictor_cols <- setdiff(
-    names(original),
-    c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
-  )
-
-unchanged <- all(
-    sapply(predictor_cols, function(col) {
-      idx <- !is.na(original[[col]])
-      identical(
-        original[[col]][idx],
-        imputed[[col]][idx]
-      )
-    })
-  )
-  return(unchanged)
-}
-
-
-check_imputation(macro, macro_model)
-check_imputation(macro_fin, macro_fin_model)
-```
-#8. LASSO model 
+#7. LASSO model 
 reusable function - have to think about the announcement delays from NBER, as mentioned by prof, this assumption may introduce lookahead bias... can consider incorporating announcement delays into model specification (18 months following Davig and Hall),, so like restruct training observations to those at least h + 18 months before forecast origin
 ```{r}
 fit_lasso <- function(train_data, horizon, post=FALSE) {
@@ -348,7 +293,7 @@ range(test_forecast$predicted_prob)
 
 ```
 
-#9. Out of Sample forecasting
+#8. Out of Sample forecasting
 
 ```{r}
 datasets <- list(Macro = macro_model, Macro_Financial = macro_fin_model)
@@ -418,7 +363,7 @@ forecast_results %>%
 ```
 ## POINT TO NOTE (TO ADD IN REPORT) Across all LASSO specifications and forecast horizons, the models produce an extremely confident false positive in April 2020. This may reflect the exceptional nature of the COVID-19 recession, which lasted only two months. Historically, severe deteriorations in macroeconomic conditions are associated with more persistent recessions, potentially leading the models to overestimate future recession risk. Furthermore, because the target variable captures recession occurrence strictly after the forecast-origin month, April 2020 is classified as a non-recession outcome despite being a recessionary month itself. This illustrates the sensitivity of recession forecasting to both unusual economic shocks and the definition of the forecasting target.
 
-# 10. Evaluation of results
+# 9. Evaluation of results
 
 ```{r}
 evaluate_forecasts <- function(df, threshold = 0.5) {
@@ -462,6 +407,27 @@ print(evaluation_results, n=Inf)
 Comparison between Macroeconomic indicators model and Financial + Macroeconomic variables model
 
 ```{r}
+financial_comparison <- evaluation_results %>%
+  select(dataset, horizon, model, AUC, F1,
+         Balanced_Accuracy, Brier) %>%
+  pivot_wider(
+    names_from = dataset,
+    values_from = c(AUC, F1, Balanced_Accuracy, Brier)
+  ) %>%
+  mutate(
+    AUC_gain = AUC_Macro_Financial - AUC_Macro,
+    F1_gain = F1_Macro_Financial - F1_Macro,
+    Balanced_Accuracy_gain =
+      Balanced_Accuracy_Macro_Financial -
+      Balanced_Accuracy_Macro,
+    Brier_improvement = Brier_Macro - Brier_Macro_Financial
+  ) %>%
+  select(
+    horizon, model,
+    AUC_gain, F1_gain,
+    Balanced_Accuracy_gain, Brier_improvement
+  )
 
+print(financial_comparison, n = Inf)
 ```
 
