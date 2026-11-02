@@ -1,5 +1,5 @@
 ---
-title: "Data Processing Part 2"
+title: "Random Forest"
 author: "Shannon Kwok"
 date: "`r Sys.Date()`"
 output: html_document
@@ -7,4 +7,332 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Import packages
+
+```{r import-packages, message=FALSE, warning=FALSE}
+library(dplyr)
+library(readr)
+library(tidyr)
+library(ranger)    
+library(pROC)     
+library(knitr)
+library(ggplot2)   
+set.seed(1213) # same seed as LASSO
+```
+
+## 1. Load data
+
+```{r load-data}
+macro <- read_csv("../data/processed/fred_md_macro_clean_final.csv", show_col_types = FALSE)
+macro_fin <- read_csv("../data/processed/fred_md_macro_financial_clean_final.csv", show_col_types = FALSE)
+
+# Number of predictors (p) used to set mtry later
+p_macro <- ncol(macro) - 2  # excludes sasdate and USREC
+p_macro_fin <- ncol(macro_fin) - 2
+c(p_macro = p_macro, p_macro_fin = p_macro_fin)
+```
+
+## 2. Target construction
+
+```{r target-construction}
+
+create_targets <- function(df) {
+  df <- df %>%
+    arrange(sasdate)
+  for (h in c(3, 6, 12)) {
+    future_recession <- sapply(
+      seq_len(nrow(df)),
+      function(i) {
+        future_rows <- (i + 1):(i + h)
+        # Exclude observations without complete future data
+        if (max(future_rows) > nrow(df)) {
+          return(NA_integer_)
+        }
+        future_values <- df$USREC[future_rows]
+        # Handle missing recession indicators
+        if (any(is.na(future_values))) {
+          return(NA_integer_)
+        }
+
+        # 1 if any future month is recessionary
+        as.integer(any(future_values == 1))
+      }
+    )
+    df[[paste0("Y_", h)]] <- future_recession
+  }
+  return(df)
+}
+
+
+macro <- create_targets(macro)
+macro_fin <- create_targets(macro_fin)
+
+#logic check
+macro %>%
+  select(sasdate, USREC, Y_3, Y_6, Y_12) %>%
+  filter(
+    sasdate >= as.Date("2007-01-01"),
+    sasdate <= as.Date("2008-06-01")
+  ) %>%
+  print(n = Inf)
+```
+
+## 3. Train-Test Split
+
+Rows with date before 1986-01-01 form the training set, and rows from 1986-01-01 onwards form the test set.
+
+```{r train-test-split}
+test_start <- as.Date("1986-01-01")
+
+# Label training and testing periods
+macro <- macro %>% 
+  mutate(sample = if_else(sasdate < test_start, "train", "test"))
+
+macro_fin <- macro_fin %>% 
+  mutate(sample = if_else(sasdate < test_start, "train", "test"))
+
+# Check the split
+macro %>%
+  group_by(sample) %>%
+  summarise(start_date = min(sasdate),
+            end_date = max(sasdate),
+            observations = n(),
+            recession_months = sum(USREC == 1),
+            .groups = "drop")
+
+macro_fin %>%
+  group_by(sample) %>%
+  summarise(start_date = min(sasdate), 
+            end_date = max(sasdate), 
+            observations = n(), 
+            recession_months = sum(USREC == 1), 
+            .groups = "drop")
+```
+
+## 4. Random Forest and Bagging
+
+Expanding window, same setup as LASSO: at each forecast date, train on all rows whose target period has already ended, then predict using that month's indicators. Bagging is a random forest with mtry = p. First pass, per the prof's comments: 500 trees, mtry = floor(sqrt(p)) for RF, no tuning.
+
+```{r forecast-rf-function}
+forecast_rf <- function(df, horizon, model_type = c("RF", "Bagging"),
+                        num_trees = 500, refit_every = 1,
+                        test_start = as.Date("1986-01-01")) {
+  model_type <- match.arg(model_type)
+  target <- paste0("Y_", horizon)
+
+  # exclude non-predictor columns
+  predictor_cols <- setdiff(names(df), c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample"))
+  p <- length(predictor_cols)
+  mtry <- if (model_type == "RF") floor(sqrt(p)) else p   # Bagging = RF with mtry = p
+
+  df <- df %>% arrange(sasdate)
+
+  # test observations with known outcomes
+  test_indices <- which(df$sasdate >= test_start & !is.na(df[[target]]))
+  results <- vector("list", length(test_indices))
+  model <- NULL
+
+  for (j in seq_along(test_indices)) {
+    i <- test_indices[j]
+
+    # re-fit on an expanding window every `refit_every` months
+    if ((j - 1) %% refit_every == 0) {
+      # latest training observation with completed target window (same as LASSO)
+      train_data <- df[seq_len(i - horizon - 1), , drop = FALSE] %>%
+        filter(!is.na(.data[[target]]))
+
+      model <- ranger(
+        x = train_data[, predictor_cols],
+        y = factor(train_data[[target]], levels = c(0, 1)),
+        num.trees = num_trees,
+        mtry = mtry,
+        probability = TRUE
+      )
+    }
+
+    # predict using current month's indicators
+    prob <- predict(model, df[i, predictor_cols])$predictions[, "1"]
+
+    results[[j]] <- data.frame(
+      sasdate = df$sasdate[i],
+      horizon = horizon,
+      actual = df[[target]][i],
+      predicted_prob = prob
+    )
+  }
+  bind_rows(results)
+}
+```
+
+```{r rf-forecasts, cache=TRUE}
+datasets <- list(Macro = macro, Macro_Financial = macro_fin)
+horizons <- c(3, 6, 12)
+model_types <- c("RF", "Bagging")
+
+all_forecasts <- list()
+
+for (dataset_name in names(datasets)) {
+  for (h in horizons) {
+    for (model_type in model_types) {
+      cat("Running:", dataset_name, h, model_type, "\n")
+      result <- forecast_rf(
+        df = datasets[[dataset_name]],
+        horizon = h,
+        model_type = model_type
+      )
+      result$dataset <- dataset_name
+      result$model <- model_type
+      all_forecasts[[paste(dataset_name, h, model_type, sep = "_")]] <- result
+    }
+  }
+}
+
+rf_forecast_results <- bind_rows(all_forecasts)
+head(rf_forecast_results)
+```
+
+```{r rf-forecast-check}
+# verify that all 12 configurations ran successfully
+rf_forecast_results %>%
+  group_by(dataset, horizon, model) %>%
+  summarise(n_forecasts  = n(),
+            unique_dates = n_distinct(sasdate),
+            min_prob     = min(predicted_prob),
+            max_prob     = max(predicted_prob),
+            .groups = "drop")
+```
+
+```{r rf-extreme-predictions}
+# check where very confident predictions occur, and whether they were correct
+rf_forecast_results %>%
+  filter(predicted_prob > 0.9) %>%
+  group_by(dataset, horizon, model) %>%
+  summarise(
+    n_extreme = n(),
+    correct   = sum(actual == 1),
+    incorrect = sum(actual == 0),
+    false_positive_dates = paste(as.character(sasdate[actual == 0]), collapse = ", "),
+    .groups = "drop"
+  )
+```
+
+## 5. Evaluation
+
+### 5.1 Forecast metrics
+
+Same metrics as `LASSO.Rmd` Section 9, so the results tables are directly comparable. AUC is the headline measure; F1 and balanced accuracy use a 0.5 threshold.
+
+```{r rf-evaluate}
+evaluate_forecasts <- function(df, threshold = 0.5) {
+  actual <- df$actual
+  prob <- df$predicted_prob
+
+  # convert probabilities into binary predictions
+  predicted <- as.integer(prob >= threshold)
+
+  # confusion matrix components
+  TP <- sum(predicted == 1 & actual == 1)
+  TN <- sum(predicted == 0 & actual == 0)
+  FP <- sum(predicted == 1 & actual == 0)
+  FN <- sum(predicted == 0 & actual == 1)
+
+  # classification metrics
+  precision <- ifelse(TP + FP == 0, 0, TP / (TP + FP))
+  recall <- ifelse(TP + FN == 0, NA_real_, TP / (TP + FN))
+  specificity <- ifelse(TN + FP == 0, NA_real_, TN / (TN + FP))
+  f1 <- ifelse(precision + recall == 0, 0, 2 * precision * recall / (precision + recall))
+  balanced_accuracy <- (recall + specificity) / 2
+
+  # probability-based evaluation
+  brier <- mean((actual - prob)^2)
+
+  # ROC-AUC
+  auc_value <- as.numeric(auc(roc(actual, prob, quiet = TRUE)))
+  data.frame(AUC = auc_value, F1 = f1, Balanced_Accuracy = balanced_accuracy, Brier = brier)
+}
+
+rf_evaluation_results <- rf_forecast_results %>%
+  group_by(dataset, horizon, model) %>%
+  group_modify(~ evaluate_forecasts(.x)) %>%
+  ungroup()
+
+print(rf_evaluation_results, n = Inf)
+```
+
+### 5.2 Macro vs Macro + Financial
+
+Gain from adding financial variables, for each horizon and model (positive = financial variables help; for Brier, positive = lower error).
+
+```{r rf-financial-comparison}
+rf_financial_comparison <- rf_evaluation_results %>%
+  pivot_wider(names_from = dataset,
+              values_from = c(AUC, F1, Balanced_Accuracy, Brier)) %>%
+  mutate(
+    AUC_gain = AUC_Macro_Financial - AUC_Macro,
+    F1_gain = F1_Macro_Financial - F1_Macro,
+    Balanced_Accuracy_gain = Balanced_Accuracy_Macro_Financial - Balanced_Accuracy_Macro,
+    Brier_improvement = Brier_Macro - Brier_Macro_Financial
+  ) %>%
+  select(horizon, model, AUC_gain, F1_gain, Balanced_Accuracy_gain, Brier_improvement) %>%
+  arrange(model, horizon)
+
+print(rf_financial_comparison, n = Inf)
+```
+
+### 5.3 Is the AUC gain significant? (block bootstrap)
+
+Resample 24-month blocks of test months (same months for both datasets) and recompute the AUC gain 1,000 times. Blocks keep the autocorrelation in monthly data. If the 95% interval excludes 0, financial variables significantly change AUC at that horizon.
+
+```{r rf-auc-bootstrap, cache=TRUE}
+block_bootstrap_auc_gain <- function(actual, prob_macro, prob_fin,
+                                     block_length = 24, n_boot = 1000) {
+  n <- length(actual)
+  n_blocks <- ceiling(n / block_length)
+
+  gains <- replicate(n_boot, {
+    starts <- sample(1:(n - block_length + 1), n_blocks, replace = TRUE)
+    idx <- unlist(lapply(starts, function(s) s:(s + block_length - 1)))[1:n]
+    y <- actual[idx]
+    if (length(unique(y)) < 2) return(NA_real_)   # resample with no recession: skip
+    as.numeric(auc(y, prob_fin[idx], quiet = TRUE)) -
+      as.numeric(auc(y, prob_macro[idx], quiet = TRUE))
+  })
+
+  data.frame(
+    AUC_gain = as.numeric(auc(actual, prob_fin, quiet = TRUE)) -
+               as.numeric(auc(actual, prob_macro, quiet = TRUE)),
+    CI_lower = quantile(gains, 0.025, na.rm = TRUE),
+    CI_upper = quantile(gains, 0.975, na.rm = TRUE),
+    valid_resamples = sum(!is.na(gains))
+  )
+}
+
+set.seed(1213)
+auc_gain_ci <- rf_forecast_results %>%
+  select(sasdate, horizon, model, dataset, actual, predicted_prob) %>%
+  pivot_wider(names_from = dataset, values_from = predicted_prob) %>%
+  arrange(sasdate) %>%
+  group_by(horizon, model) %>%
+  group_modify(~ block_bootstrap_auc_gain(.x$actual, .x$Macro, .x$Macro_Financial)) %>%
+  ungroup() %>%
+  mutate(significant = CI_lower > 0 | CI_upper < 0) %>%
+  arrange(model, horizon)
+
+print(auc_gain_ci, n = Inf)
+```
+
+### 5.4 RF vs Bagging
+
+Positive = RF beats bagging. If bagging wins on Macro + Financial but not on Macro, a dominant financial predictor is likely driving the result (the prof's point).
+
+```{r rf-vs-bagging}
+rf_vs_bagging <- rf_evaluation_results %>%
+  select(dataset, horizon, model, AUC) %>%
+  pivot_wider(names_from = model, values_from = AUC) %>%
+  mutate(RF_minus_Bagging = RF - Bagging) %>%
+  arrange(dataset, horizon)
+
+print(rf_vs_bagging, n = Inf)
 ```
