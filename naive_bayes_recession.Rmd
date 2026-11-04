@@ -1,0 +1,606 @@
+---
+title: "Naive Bayes Recession Forecasting"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Naive Bayes models
+
+```{r section_1, echo=TRUE}
+# Models:
+#   1. Macroeconomic indicators only
+#   2. Macroeconomic + financial indicators
+# Forecast horizons: 3, 6, 12 months
+# Evaluation metrics: AUC and F1 Score
+```
+
+## Packages
+
+```{r section_2, echo=TRUE}
+packages <- c(
+  "readr",
+  "dplyr",
+  "tidyr",
+  "lubridate",
+  "e1071",
+  "pROC",
+  "ggplot2"
+)
+
+missing_packages <- setdiff(
+  packages,
+  rownames(installed.packages())
+)
+
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+invisible(
+  lapply(packages, library, character.only = TRUE)
+)
+
+set.seed(123)
+```
+
+## Configuration
+
+```{r section_3, echo=TRUE}
+
+HORIZONS <- c(3, 6, 12)
+
+# Chronological split:
+# Initial training target dates: before January 1980
+# Validation target dates: January 1980 - December 1985
+# Final model training target dates: before January 1986
+# OOS forecast origins: January 1986 onward
+# Four episodes before 1986, four from 1986 onward.
+
+VALIDATION_START <- as.Date("1980-01-01")
+TEST_START <- as.Date("1986-01-01")
+
+# Numerical stabilization for Gaussian Naive Bayes
+# To control for numerical instability if variance of predictor within a class is too small
+NB_EPSILON <- 1e-6
+
+# Main classification threshold (fixed baseline)
+FIXED_THRESHOLD <- 0.50
+
+# Candidate thresholds for validation-only robustness analysis
+THRESHOLD_GRID <- seq(
+  0.05,
+  0.95,
+  by = 0.01
+)
+```
+
+## Load Data
+
+```{r section_4, echo=TRUE}
+# Load datasets directly
+macro_data <- read_csv(
+  "../data/processed/fred_md_macro_clean_final.csv",
+  show_col_types = FALSE
+)
+
+full_data <- read_csv(
+  "../data/processed/fred_md_macro_financial_clean_final.csv",
+  show_col_types = FALSE
+)
+
+# Ensure dates are correctly formatted
+macro_data <- macro_data %>%
+  mutate(sasdate = as.Date(sasdate))
+
+full_data <- full_data %>%
+  mutate(sasdate = as.Date(sasdate))
+
+# Identify predictors
+macro_predictors <- setdiff(
+  names(macro_data),
+  c("sasdate", "USREC")
+)
+
+full_predictors <- setdiff(
+  names(full_data),
+  c("sasdate", "USREC")
+)
+
+financial_predictors <- setdiff(
+  full_predictors,
+  macro_predictors
+)
+
+# Validate predictors
+if (!all(macro_predictors %in% full_predictors)) {
+  stop("Some macro predictors are absent from full dataset.")
+}
+
+# Display predictor counts
+
+cat("\nNumber of macro predictors:",
+    length(macro_predictors))
+
+cat("\nNumber of financial predictors:",
+    length(financial_predictors))
+
+cat("\nTotal predictors in full model:",
+    length(full_predictors), "\n")
+```
+
+## Create Forecast Target
+
+```{r section_5, echo=TRUE}
+# Y_t^(h) = USREC_(t+h)
+# Predict recession status exactly h months ahead.
+
+create_target <- function(df, horizon) {
+  
+  df %>%
+    mutate(
+      target = lead(USREC, horizon),
+      target_date = sasdate %m+% months(horizon)
+    ) %>%
+    filter(!is.na(target))
+}
+```
+
+## Evaluation Metrics: F1 And Auc
+
+```{r section_6, echo=TRUE}
+calculate_metrics <- function(
+    actual,
+    probability,
+    threshold = 0.5
+) {
+  
+  predicted <- as.integer(
+    probability >= threshold
+  )
+  
+  TP <- sum(predicted == 1 & actual == 1)
+  FP <- sum(predicted == 1 & actual == 0)
+  FN <- sum(predicted == 0 & actual == 1)
+  
+  # F1 Score
+  denominator <- 2 * TP + FP + FN
+  
+  f1 <- if (denominator == 0) {
+    0
+  } else {
+    2 * TP / denominator
+  }
+  
+  # AUC
+  auc_value <- if (
+    length(unique(actual)) == 2
+  ) {
+    
+    roc_obj <- pROC::roc(
+      response = actual,
+      predictor = probability,
+      levels = c(0, 1),
+      direction = "<",
+      quiet = TRUE
+    )
+    
+    as.numeric(
+      pROC::auc(roc_obj)
+    )
+    
+  } else {
+    NA_real_
+  }
+  
+  data.frame(
+    AUC = auc_value,
+    F1 = f1
+  )
+}
+```
+
+## Robustness Check: Validation-Optimized Threshold
+
+```{r section_7, echo=TRUE}
+# Main results use FIXED_THRESHOLD = 0.50.
+# This alternative threshold is selected using validation F1 only.
+# OOS test observations are not used to select thresholds.
+
+optimize_threshold <- function(
+    actual,
+    probability
+) {
+  
+  scores <- sapply(
+    THRESHOLD_GRID,
+    function(th) {
+      
+      calculate_metrics(
+        actual = actual,
+        probability = probability,
+        threshold = th
+      )$F1
+    }
+  )
+  
+  # If multiple thresholds tie, select the one
+  # closest to 0.5.
+  
+  best <- which(
+    scores == max(scores, na.rm = TRUE)
+  )
+  
+  best <- best[
+    which.min(
+      abs(THRESHOLD_GRID[best] - 0.5)
+    )
+  ]
+  
+  return(THRESHOLD_GRID[best])
+}
+```
+
+## Fit Gaussian Naive Bayes
+
+```{r section_8, echo=TRUE}
+fit_nb_model <- function(train, predictors) {
+  
+  x_train <- train[, predictors, drop = FALSE]
+  
+  # Keep predictors with sufficient finite observations
+  valid_vars <- predictors[
+    sapply(x_train, function(x) {
+      observed <- x[is.finite(x)]
+      length(observed) >= 2 &&
+        length(unique(observed)) > 1
+    })
+  ]
+  
+  if (length(valid_vars) == 0) {
+    stop("No usable predictors.")
+  }
+  
+  x_train <- x_train[, valid_vars, drop = FALSE]
+  
+  # Calculate medians using training data only
+  medians <- sapply(x_train, function(x) {
+    median(x[is.finite(x)])
+  })
+  
+  # Replace missing values with training medians
+  for (v in valid_vars) {
+    x_train[[v]][!is.finite(x_train[[v]])] <- medians[[v]]
+  }
+  
+  x_train$target <- factor(
+    train$target,
+    levels = c(0, 1)
+  )
+  
+  if (length(unique(train$target)) < 2) {
+    stop("Training data must contain both classes.")
+  }
+  
+  model <- e1071::naiveBayes(
+    target ~ .,
+    data = x_train,
+    laplace = 1,
+    threshold = NB_EPSILON,
+    eps = NB_EPSILON
+  )
+  
+  list(
+    model = model,
+    variables = valid_vars,
+    medians = medians
+  )
+}
+
+predict_nb <- function(fitted, newdata) {
+  
+  x <- newdata[
+    , fitted$variables,
+    drop = FALSE
+  ]
+  
+  # Replace missing values using TRAINING medians (Prevent Data Leakage)
+  for (v in fitted$variables) {
+    x[[v]][!is.finite(x[[v]])] <- fitted$medians[[v]]
+  }
+  
+  prob <- predict(
+    fitted$model,
+    newdata = x,
+    type = "raw"
+  )
+  
+  as.numeric(prob[, "1"])
+}
+```
+
+## Train And Evaluate One Model
+
+```{r section_9, echo=TRUE}
+run_nb <- function(
+    df,
+    horizon,
+    model_name
+) {
+  
+  data_h <- create_target(
+    df,
+    horizon
+  )
+  
+  predictors <- setdiff(
+    names(df),
+    c("sasdate", "USREC")
+  )
+  
+  # ----------------------------------------------------------
+  # A. INITIAL TRAINING / VALIDATION
+  # ----------------------------------------------------------
+  
+  train <- data_h %>%
+    filter(
+      target_date < VALIDATION_START
+    )
+  
+  validation <- data_h %>%
+    filter(
+      target_date >= VALIDATION_START,
+      target_date < TEST_START
+    )
+  
+  if (
+    nrow(train) == 0 ||
+    nrow(validation) == 0
+  ) {
+    stop("Training or validation sample is empty.")
+  }
+  
+  # Fit model on initial training data
+  initial_fit <- fit_nb_model(
+    train,
+    predictors
+  )
+  
+  # Validation probabilities
+  val_prob <- predict_nb(
+    initial_fit,
+    validation
+  )
+  
+  # Optimize F1 classification threshold
+  best_threshold <- optimize_threshold(
+    validation$target,
+    val_prob
+  )
+  
+  # ----------------------------------------------------------
+  # B. REFIT USING ALL PRE-OOS OBSERVATIONS
+  # ----------------------------------------------------------
+  
+  final_train <- data_h %>%
+    filter(
+      target_date < TEST_START
+    )
+  
+  final_fit <- fit_nb_model(
+    final_train,
+    predictors
+  )
+  
+  # ----------------------------------------------------------
+  # C. OUT-OF-SAMPLE TESTING
+  # ----------------------------------------------------------
+  
+  test <- data_h %>%
+    filter(
+      sasdate >= TEST_START
+    )
+  
+  if (nrow(test) == 0) {
+    stop("OOS test sample is empty.")
+  }
+  
+  # All final training targets end before the first test forecast origin.
+  stopifnot(max(final_train$target_date) < min(test$sasdate))
+  
+  # Predict OOS probabilities
+  test_prob <- predict_nb(
+    final_fit,
+    test
+  )
+  
+  # Main test predictions: fixed 0.50 threshold
+  test_pred <- as.integer(test_prob >= FIXED_THRESHOLD)
+  
+  # Primary evaluation: fixed-threshold F1 and threshold-independent AUC
+  metrics <- calculate_metrics(
+    actual = test$target,
+    probability = test_prob,
+    threshold = FIXED_THRESHOLD
+  )
+  
+  # Robustness check: validation-optimized threshold applied unchanged to test
+  robustness_metrics <- calculate_metrics(
+    actual = test$target,
+    probability = test_prob,
+    threshold = best_threshold
+  )
+  
+  metrics$Horizon <- horizon
+  metrics$Model <- model_name
+  metrics$Threshold <- FIXED_THRESHOLD
+  metrics$Optimized_Threshold <- best_threshold
+  metrics$F1_Optimized <- robustness_metrics$F1
+  metrics$Delta_F1_Optimized_vs_Fixed <- robustness_metrics$F1 - metrics$F1
+  metrics$Train_N <- nrow(final_train)
+  metrics$Validation_N <- nrow(validation)
+  metrics$Test_N <- nrow(test)
+  metrics$Predictors <- length(
+    final_fit$variables
+  )
+  
+  predictions <- data.frame(
+    date = test$sasdate,
+    target_date = test$target_date,
+    actual = test$target,
+    probability = test_prob,
+    predicted = test_pred,
+    horizon = horizon,
+    model = model_name
+  )
+  
+  list(
+    model = final_fit$model,
+    variables = final_fit$variables,
+    medians = final_fit$medians,
+    metrics = metrics,
+    predictions = predictions,
+    validation_threshold = best_threshold
+  )
+}
+```
+
+## Train All Six Models
+
+```{r section_10, echo=TRUE}
+results <- list()
+
+for (h in HORIZONS) {
+  
+  cat("\n================================\n")
+  cat("Forecast horizon:", h, "months\n")
+  cat("================================\n")
+  
+  # Model 1: Macroeconomic indicators only
+  results[[paste0("Macro_", h)]] <- run_nb(
+    macro_data,
+    horizon = h,
+    model_name = "Macro"
+  )
+  
+  # Model 2: Macroeconomic + financial indicators
+  results[[paste0("Full_", h)]] <- run_nb(
+    full_data,
+    horizon = h,
+    model_name = "Macro + Financial"
+  )
+}
+```
+
+## Combine Model Results
+
+```{r section_11, echo=TRUE}
+metrics_table <- bind_rows(
+  lapply(results, function(x) x$metrics)
+) %>%
+  select(
+    Horizon,
+    Model,
+    Predictors,
+    Train_N,
+    Validation_N,
+    Test_N,
+    Threshold,
+    AUC,
+    F1,
+    Optimized_Threshold,
+    F1_Optimized,
+    Delta_F1_Optimized_vs_Fixed
+  ) %>%
+  arrange(Horizon, Model)
+```
+
+## Incremental Value Of Financial Indicators
+
+```{r section_12, echo=TRUE}
+comparison <- metrics_table %>%
+  select(Horizon, Model, AUC, F1) %>%
+  pivot_wider(
+    names_from = Model,
+    values_from = c(AUC, F1)
+  ) %>%
+  mutate(
+    Delta_AUC =
+      `AUC_Macro + Financial` - AUC_Macro,
+    Delta_F1 =
+      `F1_Macro + Financial` - F1_Macro
+  ) %>%
+  select(Horizon, Delta_AUC, Delta_F1)
+
+# Add incremental value to the main metrics table
+metrics_table <- metrics_table %>%
+  left_join(comparison, by = "Horizon")
+
+knitr::kable(
+  metrics_table,
+  digits = 3,
+  caption = "Naive Bayes Out-of-Sample Model Performance"
+)
+```
+
+## Combine Out-Of-Sample Predictions
+
+```{r section_13, echo=TRUE}
+predictions_table <- bind_rows(
+  lapply(results, function(x) x$predictions)
+) %>%
+  arrange(horizon, model, date)
+```
+
+## Generate Roc Curves
+
+```{r section_14, echo=TRUE}
+create_roc_plot <- function(h) {
+  
+  horizon_data <- predictions_table %>%
+    filter(horizon == h)
+  
+  roc_list <- lapply(
+    split(horizon_data, horizon_data$model),
+    function(d) {
+      pROC::roc(
+        response = d$actual,
+        predictor = d$probability,
+        levels = c(0, 1),
+        direction = "<",
+        quiet = TRUE
+      )
+    }
+  )
+  
+  pROC::ggroc(roc_list) +
+    geom_abline(
+      slope = 1,
+      intercept = 0,
+      linetype = "dashed",
+      color = "grey50"
+    ) +
+    labs(
+      title = paste0(
+        "ROC Curve: ",
+        h,
+        "-Month Recession Forecast"
+      ),
+      x = "False Positive Rate",
+      y = "True Positive Rate",
+      color = "Model"
+    ) +
+    theme_minimal()
+}
+
+# Generate and display ROC curves
+for (h in HORIZONS) {
+  print(create_roc_plot(h))
+}
+```
