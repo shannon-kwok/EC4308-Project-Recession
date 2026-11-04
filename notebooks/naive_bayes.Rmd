@@ -478,10 +478,6 @@ results <- list()
 
 for (h in HORIZONS) {
   
-  cat("\n================================\n")
-  cat("Forecast horizon:", h, "months\n")
-  cat("================================\n")
-  
   # Model 1: Macroeconomic indicators only
   results[[paste0("Macro_", h)]] <- run_nb(
     macro_data,
