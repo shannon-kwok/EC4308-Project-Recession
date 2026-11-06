@@ -36,8 +36,11 @@ c(p_macro = p_macro, p_macro_fin = p_macro_fin)
 
 ## 2. Target construction
 
+Construct Y_3, Y_6 and Y_12 columns for 3, 6 and 12 month horizons.
+
 ```{r target-construction}
 
+# Construct Y_3, Y_6, Y_12 
 create_targets <- function(df) {
   df <- df %>%
     arrange(sasdate)
@@ -69,7 +72,7 @@ create_targets <- function(df) {
 macro <- create_targets(macro)
 macro_fin <- create_targets(macro_fin)
 
-#logic check
+# logic check using 2008 recession as example
 macro %>%
   select(sasdate, USREC, Y_3, Y_6, Y_12) %>%
   filter(
@@ -81,7 +84,7 @@ macro %>%
 
 ## 3. Train-Test Split
 
-Rows with date before 1986-01-01 form the training set, and rows from 1986-01-01 onwards form the test set.
+Rows before 1986-01-01 form the training set, and rows from 1986-01-01 onwards form the test set.
 
 ```{r train-test-split}
 test_start <- as.Date("1986-01-01")
@@ -113,23 +116,25 @@ macro_fin %>%
 
 ## 4. Random Forest and Bagging
 
-Expanding window, same setup as LASSO: at each forecast date, train on all rows whose target period has already ended, then predict using that month's indicators. Bagging is a random forest with mtry = p. First pass, per the prof's comments: 500 trees, mtry = floor(sqrt(p)) for RF, no tuning.
+Here, we use an expanding window (same as other models). At each forecast date, the model is trained on all rows whose target period has already ended, then predict using that month's indicators. 
+
+We try both Random Forest and Bagging. Bagging is a random forest with `mtry = p`. We run our first pass with 500 trees, `mtry = floor(sqrt(p))` for RF, with no tuning.
 
 ```{r forecast-rf-function}
-forecast_rf <- function(df, horizon, model_type = c("RF", "Bagging"),
+forecast_rf <- function(df, horizon, model_type = c("RF", "Bagging"), mtry = NULL,
                         num_trees = 500, refit_every = 1,
                         test_start = as.Date("1986-01-01")) {
-  model_type <- match.arg(model_type)
+  model_type <- match.arg(model_type)  # check that model type is one of the 2 options
   target <- paste0("Y_", horizon)
 
   # exclude non-predictor columns
   predictor_cols <- setdiff(names(df), c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample"))
   p <- length(predictor_cols)
-  mtry <- if (model_type == "RF") floor(sqrt(p)) else p   # Bagging = RF with mtry = p
+  if (is.null(mtry)) mtry <- if (model_type == "RF") floor(sqrt(p)) else p   
 
   df <- df %>% arrange(sasdate)
 
-  # test observations with known outcomes
+  # start from beginning of test set and drop test observations with unknown outcomes
   test_indices <- which(df$sasdate >= test_start & !is.na(df[[target]]))
   results <- vector("list", length(test_indices))
   model <- NULL
@@ -137,9 +142,9 @@ forecast_rf <- function(df, horizon, model_type = c("RF", "Bagging"),
   for (j in seq_along(test_indices)) {
     i <- test_indices[j]
 
-    # re-fit on an expanding window every `refit_every` months
+    # re-fit on an expanding window every 1 month
     if ((j - 1) %% refit_every == 0) {
-      # latest training observation with completed target window (same as LASSO)
+      # build training set using expanding window 
       train_data <- df[seq_len(i - horizon - 1), , drop = FALSE] %>%
         filter(!is.na(.data[[target]]))
 
@@ -148,13 +153,14 @@ forecast_rf <- function(df, horizon, model_type = c("RF", "Bagging"),
         y = factor(train_data[[target]], levels = c(0, 1)),
         num.trees = num_trees,
         mtry = mtry,
-        probability = TRUE
+        probability = TRUE  # output recession probabilities instead of binary values
       )
     }
 
-    # predict using current month's indicators
+    # predict current test month using current month's indicators
     prob <- predict(model, df[i, predictor_cols])$predictions[, "1"]
 
+    # store results
     results[[j]] <- data.frame(
       sasdate = df$sasdate[i],
       horizon = horizon,
@@ -166,30 +172,41 @@ forecast_rf <- function(df, horizon, model_type = c("RF", "Bagging"),
 }
 ```
 
-```{r rf-forecasts, cache=TRUE}
+```{r rf-forecasts}
 datasets <- list(Macro = macro, Macro_Financial = macro_fin)
 horizons <- c(3, 6, 12)
 model_types <- c("RF", "Bagging")
 
-all_forecasts <- list()
+rf_file <- "../data/results/rf_forecasts.rds"
 
-for (dataset_name in names(datasets)) {
-  for (h in horizons) {
-    for (model_type in model_types) {
-      cat("Running:", dataset_name, h, model_type, "\n")
-      result <- forecast_rf(
-        df = datasets[[dataset_name]],
-        horizon = h,
-        model_type = model_type
-      )
-      result$dataset <- dataset_name
-      result$model <- model_type
-      all_forecasts[[paste(dataset_name, h, model_type, sep = "_")]] <- result
+# load saved forecasts if exists, if not run every combination (delete the file to force a re-run)
+if (file.exists(rf_file)) {
+  rf_forecast_results <- readRDS(rf_file)
+} else {
+  all_forecasts <- list()
+
+  for (dataset_name in names(datasets)) {
+    for (h in horizons) {
+      for (model_type in model_types) {
+        cat("Running:", dataset_name, h, model_type, "\n")
+        result <- forecast_rf(
+          df = datasets[[dataset_name]],
+          horizon = h,
+          model_type = model_type
+        )
+        result$dataset <- dataset_name
+        result$model <- model_type
+        all_forecasts[[paste(dataset_name, h, model_type, sep = "_")]] <- result
+      }
     }
   }
+
+  # combine and save results
+  rf_forecast_results <- bind_rows(all_forecasts)
+  dir.create(dirname(rf_file), showWarnings = FALSE)
+  saveRDS(rf_forecast_results, rf_file)
 }
 
-rf_forecast_results <- bind_rows(all_forecasts)
 head(rf_forecast_results)
 ```
 
@@ -199,13 +216,11 @@ rf_forecast_results %>%
   group_by(dataset, horizon, model) %>%
   summarise(n_forecasts  = n(),
             unique_dates = n_distinct(sasdate),
-            min_prob     = min(predicted_prob),
-            max_prob     = max(predicted_prob),
             .groups = "drop")
 ```
 
 ```{r rf-extreme-predictions}
-# check where very confident predictions occur, and whether they were correct
+# check months where model is very confident of a recession, and whether they were correct
 rf_forecast_results %>%
   filter(predicted_prob > 0.9) %>%
   group_by(dataset, horizon, model) %>%
@@ -222,7 +237,7 @@ rf_forecast_results %>%
 
 ### 5.1 Forecast metrics
 
-Same metrics as `LASSO.Rmd` Section 9, so the results tables are directly comparable. AUC is the headline measure; F1 and balanced accuracy use a 0.5 threshold.
+The same metrics are used across all models, so that the results are directly comparable. AUC is the main metric. F1 score and balanced accuracy use a 0.5 threshold.
 
 ```{r rf-evaluate}
 evaluate_forecasts <- function(df, threshold = 0.5) {
@@ -263,7 +278,8 @@ print(rf_evaluation_results, n = Inf)
 
 ### 5.2 Macro vs Macro + Financial
 
-Gain from adding financial variables, for each horizon and model (positive = financial variables help; for Brier, positive = lower error).
+We find the gain from adding financial variables for each horizon and model. We do this by differencing the AUC, F1 scores, Balanced Accuracy, and Brier scores for macro only vs macro + financial. 
+For each gain / improvement metric, a positive value means financial variables help.
 
 ```{r rf-financial-comparison}
 rf_financial_comparison <- rf_evaluation_results %>%
@@ -273,7 +289,7 @@ rf_financial_comparison <- rf_evaluation_results %>%
     AUC_gain = AUC_Macro_Financial - AUC_Macro,
     F1_gain = F1_Macro_Financial - F1_Macro,
     Balanced_Accuracy_gain = Balanced_Accuracy_Macro_Financial - Balanced_Accuracy_Macro,
-    Brier_improvement = Brier_Macro - Brier_Macro_Financial
+    Brier_improvement = Brier_Macro - Brier_Macro_Financial # Brier is flipped because lower is better
   ) %>%
   select(horizon, model, AUC_gain, F1_gain, Balanced_Accuracy_gain, Brier_improvement) %>%
   arrange(model, horizon)
@@ -281,9 +297,9 @@ rf_financial_comparison <- rf_evaluation_results %>%
 print(rf_financial_comparison, n = Inf)
 ```
 
-### 5.3 Is the AUC gain significant? (block bootstrap)
+### 5.3 Check if AUC gain is real (block bootstrap)
 
-Resample 24-month blocks of test months (same months for both datasets) and recompute the AUC gain 1,000 times. Blocks keep the autocorrelation in monthly data. If the 95% interval excludes 0, financial variables significantly change AUC at that horizon.
+To check whether the AUC gain from adding financial variables is real or due to chance, we rebuild the test period 1,000 times by randomly drawing 24-month chunks of test months, and recompute the gain each time. We use chunks rather than single months so that each recession’s months stay together since they are correlated. Both models are scored on the same months each time. If the 95% confidence interval lies entirely above 0, we can conclude that adding financial variables significantly improves AUC at that horizon.
 
 ```{r rf-auc-bootstrap, cache=TRUE}
 block_bootstrap_auc_gain <- function(actual, prob_macro, prob_fin,
@@ -325,7 +341,7 @@ print(auc_gain_ci, n = Inf)
 
 ### 5.4 RF vs Bagging
 
-Positive = RF beats bagging. If bagging wins on Macro + Financial but not on Macro, a dominant financial predictor is likely driving the result (the prof's point).
+Positive values in the difference means RF beats bagging. If bagging wins on Macro + Financial but not on Macro, a dominant financial predictor is likely driving the result.
 
 ```{r rf-vs-bagging}
 rf_vs_bagging <- rf_evaluation_results %>%
@@ -335,4 +351,187 @@ rf_vs_bagging <- rf_evaluation_results %>%
   arrange(dataset, horizon)
 
 print(rf_vs_bagging, n = Inf)
+```
+
+### 5.5 Recession-by-recession check
+
+For exploratory purposes.
+
+```{r rf-recession-episodes}
+# Recession start dates in the test period
+test_recessions <- macro %>%
+  arrange(sasdate) %>%
+  filter(USREC == 1, lag(USREC, default = 0) == 0, sasdate >= test_start) %>%
+  pull(sasdate)
+
+# Months from date a to date b
+month_diff <- function(a, b) {
+  (as.POSIXlt(b)$year - as.POSIXlt(a)$year) * 12 + (as.POSIXlt(b)$mon - as.POSIXlt(a)$mon)
+}
+
+threshold <- 0.5
+
+# For each recession: forecasts made in the h months before it started
+recession_signals <- rf_forecast_results %>%
+  crossing(recession_start = test_recessions) %>%
+  mutate(months_before = month_diff(sasdate, recession_start)) %>%
+  filter(months_before >= 1, months_before <= horizon) %>%
+  group_by(dataset, horizon, model, recession_start) %>%
+  summarise(
+    max_prob = max(predicted_prob),
+    flagged = any(predicted_prob >= threshold),
+    earliest_warning_months = if (any(predicted_prob >= threshold))
+      max(months_before[predicted_prob >= threshold]) else NA_real_,
+    .groups = "drop"
+  )
+
+print(recession_signals, n = Inf)
+
+# Summary: recessions flagged in advance (out of 4) and false-alarm months
+recession_summary <- recession_signals %>%
+  group_by(dataset, horizon, model) %>%
+  summarise(recessions_flagged = sum(flagged),
+            total_recessions = n(),
+            .groups = "drop") %>%
+  left_join(
+    rf_forecast_results %>%
+      group_by(dataset, horizon, model) %>%
+      summarise(false_alarm_months = sum(predicted_prob >= threshold & actual == 0),
+                .groups = "drop"),
+    by = c("dataset", "horizon", "model")
+  ) %>%
+  arrange(model, dataset, horizon)
+
+print(recession_summary, n = Inf)
+```
+
+### 5.6 ROC curves
+
+```{r rf-roc-curves, fig.width=10, fig.height=4}
+roc_data <- rf_forecast_results %>%
+  filter(model == "RF") %>%
+  group_by(dataset, horizon) %>%
+  group_modify(~ {
+    r <- roc(.x$actual, .x$predicted_prob, quiet = TRUE)
+    tibble(fpr = 1 - r$specificities,
+           tpr = r$sensitivities,
+           auc = as.numeric(auc(r)))
+  }) %>%
+  ungroup() %>%
+  arrange(dataset, horizon, fpr, tpr)
+
+# AUC labels for each panel
+auc_labels <- roc_data %>%
+  distinct(dataset, horizon, auc) %>%
+  mutate(label = sprintf("%s: AUC = %.2f",
+                         if_else(dataset == "Macro", "Macro", "Macro + Financial"), auc))
+
+ggplot(roc_data, aes(x = fpr, y = tpr, colour = dataset)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_step(linewidth = 0.8) +
+  geom_text(data = auc_labels,
+            aes(x = 0.98, y = if_else(dataset == "Macro", 0.08, 0.16), label = label),
+            hjust = 1, size = 3, show.legend = FALSE) +
+  facet_wrap(~ horizon, labeller = labeller(horizon = function(h) paste0(h, "-month horizon"))) +
+  scale_colour_manual(values = c(Macro = "#7A7A7A", Macro_Financial = "#1F5FA8"),
+                      labels = c(Macro = "Macro only", Macro_Financial = "Macro + Financial")) +
+  coord_equal() +
+  labs(title = "Random forest ROC curves, out-of-sample 1986 onwards",
+       x = "False positive rate (false alarms)", y = "True positive rate (recessions caught)",
+       colour = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top", panel.grid.minor = element_blank())
+```
+
+## 6. Variable Importance
+
+Permutation importance from RF model fitted on Macro + Financial data for all months with a known outcome. This is for interpretation only. It tells us which predictors the RF relies on most at each horizon.
+
+```{r var-importance}
+set.seed(1213)
+fin_vars <- setdiff(names(macro_fin), names(macro))   # the 25 financial series
+predictor_cols <- setdiff(names(macro_fin), c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample"))
+
+importance_results <- bind_rows(lapply(c(3, 6, 12), function(h) {
+  target <- paste0("Y_", h)
+  d <- macro_fin %>% filter(!is.na(.data[[target]]))
+  fit <- ranger(
+    x = d[, predictor_cols],
+    y = factor(d[[target]], levels = c(0, 1)),
+    num.trees = 500,
+    mtry = floor(sqrt(length(predictor_cols))),
+    probability = TRUE,
+    importance = "permutation"
+  )
+  tibble(horizon = h,
+         variable = names(fit$variable.importance),
+         importance = fit$variable.importance)
+})) %>%
+  mutate(group = if_else(variable %in% fin_vars, "Financial", "Macro"))
+
+# Top 10 predictors per horizon
+importance_results %>%
+  group_by(horizon) %>%
+  slice_max(importance, n = 10) %>%
+  mutate(rank = row_number()) %>%
+  ungroup() %>%
+  print(n = Inf)
+
+# Share of total importance from financial vs macro predictors
+importance_results %>%
+  mutate(importance = pmax(importance, 0)) %>%
+  group_by(horizon, group) %>%
+  summarise(total = sum(importance), .groups = "drop_last") %>%
+  mutate(share = total / sum(total)) %>%
+  ungroup() %>%
+  select(-total) %>%
+  pivot_wider(names_from = group, values_from = share)
+```
+
+
+## 7. Tuning mtry
+
+Validation uses only pre-1986 data: forecasts for 1981–85 from an expanding window that starts in 1962, with targets rebuilt on the truncated data so no post-1985 outcome is used. The 1981–82 recession falls in this block.
+
+```{r rf-tune-mtry, cache=TRUE}
+val_start <- as.Date("1981-01-01")
+
+# Validation data: pre-1986 months only, with targets rebuilt so no post-1985 outcome is used
+make_val_data <- function(df) {
+  df %>%
+    filter(sasdate < test_start) %>%
+    select(-Y_3, -Y_6, -Y_12) %>%
+    create_targets()
+}
+
+# Candidate mtry values between sqrt(p) and p
+mtry_grid <- function(p) unique(c(floor(sqrt(p)), floor(2 * sqrt(p)), floor(p / 3), floor(p / 2), p))
+
+set.seed(1213)
+tuning_results <- list()
+
+for (dataset_name in names(datasets)) {
+  val_df <- make_val_data(datasets[[dataset_name]])
+  p <- length(setdiff(names(val_df), c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")))
+
+  for (h in horizons) {
+    for (m in mtry_grid(p)) {
+      f <- forecast_rf(val_df, h, "RF", mtry = m, refit_every = 12, test_start = val_start)
+      tuning_results[[paste(dataset_name, h, m, sep = "_")]] <- tibble(
+        dataset = dataset_name, horizon = h, mtry = m,
+        val_AUC = as.numeric(auc(f$actual, f$predicted_prob, quiet = TRUE))
+      )
+    }
+  }
+}
+
+tuning_results <- bind_rows(tuning_results)
+print(tuning_results, n = Inf)
+
+# Best mtry for each dataset x horizon
+best_mtry <- tuning_results %>%
+  group_by(dataset, horizon) %>%
+  slice_max(val_AUC, n = 1, with_ties = FALSE) %>%
+  ungroup()
+best_mtry
 ```
