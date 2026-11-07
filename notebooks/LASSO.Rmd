@@ -176,6 +176,31 @@ macro %>%
     missing_count = rowSums(is.na(across(all_of(predictor_cols))))
   ) %>%
   select(sasdate, missing_count)
+
+# forward fill if missig predictor values exist
+
+forward_fill <- function(df) {
+  predictor_cols <- setdiff(
+    names(df),
+    c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+  )
+  df %>%
+    arrange(sasdate) %>%
+    fill(all_of(predictor_cols), .direction = "down")
+}
+
+# modelling datasets
+macro_model <- forward_fill(macro)
+macro_fin_model <- forward_fill(macro_fin)
+
+# verify if missing values still exist
+sum(is.na(macro_model[predictor_cols]))
+predictor_cols_fin <- setdiff(
+  names(macro_fin_model),
+  c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+)
+
+sum(is.na(macro_fin_model[predictor_cols_fin]))
 ```
 
 #7. LASSO model 
@@ -198,28 +223,6 @@ fit_lasso <- function(train_data, horizon, post=FALSE) {
   return(model)
 }
 
-train_3m <- macro_model %>%
-  filter(
-    sasdate <= as.Date("1985-09-01"),
-    !is.na(Y_3)
-  )
-
-train_3m <- macro_model %>%
-  filter(sasdate <= as.Date("1985-09-01"), !is.na(Y_3))
-
-# Standard LASSO
-lasso_3m <- fit_lasso(
-  train_data = train_3m,
-  horizon = 3,
-  post = FALSE
-)
-
-# Post-LASSO
-post_lasso_3m <- fit_lasso(
-  train_data = train_3m,
-  horizon = 3,
-  post = TRUE
-)
 
 forecast_lasso <- function(df, horizon, post=FALSE, test_start = as.Date("1986-01-01")) {
   target <- paste0("Y_", horizon)
@@ -276,20 +279,6 @@ forecast_lasso <- function(df, horizon, post=FALSE, test_start = as.Date("1986-0
   }
   bind_rows(results)
 }
-
-test_forecast <- forecast_lasso(
-  df = macro_model,
-  horizon = 3,
-  post = FALSE
-)
-
-head(test_forecast)
-
-nrow(test_forecast)
-length(unique(test_forecast$sasdate))
-
-summary(test_forecast$predicted_prob)
-range(test_forecast$predicted_prob)
 
 ```
 
@@ -429,5 +418,74 @@ financial_comparison <- evaluation_results %>%
   )
 
 print(financial_comparison, n = Inf)
+```
+# 10.  Statistical significance of AUC improvements through block bootstrap (adapted from random forest analysis)
+
+```{r}
+block_bootstrap_auc_gain <- function(actual, prob_macro, prob_fin, block_length = 24, n_boot = 1000) {
+  n <- length(actual)
+  n_blocks <- ceiling(n / block_length)
+  calculate_auc <- function(y,p) {
+    if (length(unique(y))<2) return(NA_real_)
+    as.numeric(auc(roc(
+      y,p,
+      levels=c(0,1),
+      direction = "<",
+      quiet=TRUE
+    )))
+  }
+  # observed improvement of auc
+  observed_gain <- calculate_auc(actual, prob_fin) - calculate_auc(actual, prob_macro)
+  
+  # bootstrap resampling
+  gains <- replicate(n_boot, {
+    starts <- sample(
+      seq_len(n-block_length+1),
+      n_blocks,
+      replace=TRUE
+    )
+    idx <- unlist(lapply(starts, function(s){
+      s:(s+block_length-1)
+    }))[seq_len(n)]
+    y <- actual[idx]
+    calculate_auc(y, prob_fin[idx])-
+      calculate_auc(y, prob_macro[idx])
+  })
+  gains <- gains[is.finite(gains)]
+  if (length(gains)<100){
+    stop("Too few valid bootstrap samples.")
+  }
+  data.frame(
+    AUC_gain = observed_gain,
+    CI_lower = unname(quantile(gains,0.025)),
+    CI_upper = unname(quantile(gains, 0.975)),
+    valid_resamples = length(gains)
+  )
+}
+
+# pair predictions from both sets
+paired_forecasts <- forecast_results %>%
+  select(sasdate, horizon, model, dataset, actual, predicted_prob) %>%
+  pivot_wider(names_from = dataset, values_from = c(actual,predicted_prob)) %>%
+  arrange(horizon,model,sasdate)
+
+# verify that outcomes match between the information sets
+stopifnot(all(paired_forecasts$actual_Macro == paired_forecasts$actual_Macro_Financial))
+
+# run bootstrap for each horizon and model
+set.seed(1213)
+
+lasso_auc_ci <- paired_forecasts %>%
+  group_by(horizon, model) %>%
+  group_modify(~block_bootstrap_auc_gain(
+    actual = .x$actual_Macro,
+    prob_macro = .x$predicted_prob_Macro,
+    prob_fin = .x$predicted_prob_Macro_Financial
+  )) %>%
+  ungroup() %>%
+  mutate(significant = CI_lower > 0 | CI_upper < 0) %>%
+  arrange(model, horizon)
+
+print(lasso_auc_ci, n=Inf)
 ```
 
