@@ -1,0 +1,484 @@
+---
+title: "Static Probit and Logit: Recession Forecasting Baselines (v2: announcement-aware labels)"
+author: "Vanisha"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(tibble)     # tribble()
+library(lubridate)  # %m+%, months(), interval()
+library(pROC)
+library(knitr)
+set.seed(1213)
+```
+
+# 2. Load data
+
+```{r load-data}
+macro <- read_csv("../data/processed/fred_md_macro_clean_final.csv", show_col_types = FALSE)
+macro_fin <- read_csv("../data/processed/fred_md_macro_financial_clean_final.csv", show_col_types = FALSE)
+
+# data cleaning
+macro <- macro %>% mutate(sasdate = as.Date(sasdate)) %>% arrange(sasdate)
+macro_fin <- macro_fin %>% mutate(sasdate = as.Date(sasdate)) %>% arrange(sasdate)
+
+# data check if all columns present and no duplicates present
+stopifnot(all(c("sasdate", "USREC") %in% names(macro)),
+          all(c("sasdate", "USREC") %in% names(macro_fin)),
+          !anyDuplicated(macro$sasdate), !anyDuplicated(macro_fin$sasdate))
+
+# check dataset
+kable(data.frame(dataset = c("Macro", "Macro_Financial"),
+                 rows = c(nrow(macro), nrow(macro_fin)),
+                 columns = c(ncol(macro), ncol(macro_fin))))
+```
+
+# 3. Construct targets
+
+For horizon `h`, `Y_h` equals 1 if any of the following `h` months is classified as a recession by the NBER chronology. Otherwise it equals 0. This is within-horizon forecasting, not the probability of a recession precisely at month `t+h`. A recession already under way at `t` therefore also gives `Y_h = 1`.
+
+```{r targets}
+create_targets <- function(df, horizons = c(3, 6, 12)) {
+  df <- arrange(df, sasdate)
+  for (h in horizons) {
+    y <- rep(NA_integer_, nrow(df))
+    for (i in seq_len(nrow(df))) {
+      if (i + h <= nrow(df)) {
+        future <- df$USREC[(i + 1):(i + h)]
+        if (!anyNA(future)) y[i] <- as.integer(any(future == 1))
+      }
+    }
+    df[[paste0("Y_", h)]] <- y
+  }
+  df
+}
+
+macro <- create_targets(macro)
+macro_fin <- create_targets(macro_fin)
+
+macro %>%
+  filter(sasdate >= as.Date("2007-01-01"), sasdate <= as.Date("2008-06-01")) %>%
+  select(sasdate, USREC, Y_3, Y_6, Y_12) %>% kable()
+```
+
+# 4. Observational evidence: when was recession status announced?
+
+Before designing the forecasts, we look at the data. Recession episodes are read off `USREC` (peak month = month before the first `USREC = 1`; trough month = last `USREC = 1`) and matched to the dates on which the NBER Business Cycle Dating Committee publicly announced them. The NBER states that prior to 1979 there were no formal announcements of turning points, so for those episodes the announcement date is an **assumption** (`assumed_pre1980_lag`), flagged in the table and varied as a sensitivity check.
+
+```{r nber-announcements}
+# Formal announcements of the NBER Business Cycle Dating Committee
+# (nber.org/research/business-cycle-dating). Dates are ANNOUNCEMENT dates, not turning-point dates.
+# TODO: verify every date below against nber.org before submitting.
+nber_announcements <- tribble(
+  ~type,    ~tp_month,    ~announced,
+  "peak",   "1980-01-01", "1980-06-03",
+  "trough", "1980-07-01", "1981-07-08",
+  "peak",   "1981-07-01", "1982-01-06",
+  "trough", "1982-11-01", "1983-07-08",
+  "peak",   "1990-07-01", "1991-04-25",
+  "trough", "1991-03-01", "1992-12-22",
+  "peak",   "2001-03-01", "2001-11-26",
+  "trough", "2001-11-01", "2003-07-17",
+  "peak",   "2007-12-01", "2008-12-01",
+  "trough", "2009-06-01", "2010-09-20",
+  "peak",   "2020-02-01", "2020-06-08",
+  "trough", "2020-04-01", "2021-07-19"
+) %>%
+  mutate(tp_month = as.Date(tp_month), announced = as.Date(announced))
+```
+
+```{r recession-episodes}
+# Turning-point months implied by USREC (USREC = 1 from the month after the peak through the trough month)
+get_episodes <- function(df) {
+  df <- arrange(df, sasdate)
+  rec <- coalesce(df$USREC == 1, FALSE)
+  runs <- rle(rec)
+  end_idx <- cumsum(runs$lengths)
+  start_idx <- end_idx - runs$lengths + 1L
+  is_rec <- runs$values
+  peaks <- is_rec & start_idx > 1L           # recession does not start at the first sample row
+  troughs <- is_rec & end_idx < nrow(df)     # recession has ended within the sample
+  bind_rows(
+    tibble(type = "peak", tp_month = df$sasdate[start_idx[peaks]] %m+% months(-1)),
+    tibble(type = "trough", tp_month = df$sasdate[end_idx[troughs]])
+  ) %>% arrange(tp_month)
+}
+
+assumed_pre1980_lag <- 18L   # assumption: no formal announcements before 1979; vary as a sensitivity check
+
+turning_points <- get_episodes(macro) %>%
+  left_join(nber_announcements, by = c("type", "tp_month")) %>%
+  mutate(source = if_else(is.na(announced), "assumed", "NBER"),
+         announced = if_else(is.na(announced),
+                             tp_month %m+% months(assumed_pre1980_lag), announced),
+         lag_months = floor(time_length(interval(tp_month, announced), "month") + 1e-8))
+
+# Every post-1979 episode in USREC must match a formal NBER announcement
+stopifnot(all(turning_points$source[turning_points$tp_month >= as.Date("1980-01-01")] == "NBER"))
+
+kable(turning_points %>% select(type, tp_month, announced, lag_months, source))
+```
+
+```{r lag-summary}
+lag_summary <- turning_points %>%
+  filter(source == "NBER") %>%
+  group_by(type) %>%
+  summarise(n = n(), min_lag = min(lag_months), median_lag = median(lag_months),
+            mean_lag = mean(lag_months), max_lag = max(lag_months), .groups = "drop")
+kable(lag_summary, digits = 1)
+
+peak_lag <- lag_summary %>% filter(type == "peak")
+trough_lag <- lag_summary %>% filter(type == "trough")
+D_peak <- peak_lag$max_lag   # longest observed peak-announcement lag (months)
+```
+
+## Conclusion from the observational evidence
+
+Recession status is known only with a substantial delay. Across the `r peak_lag$n` formally announced peaks, the announcement came `r peak_lag$min_lag` to `r peak_lag$max_lag` months after the peak month (median `r peak_lag$median_lag`). Across the `r trough_lag$n` troughs, it came `r trough_lag$min_lag` to `r trough_lag$max_lag` months afterwards (median `r trough_lag$median_lag`). The start of a recession is therefore announced faster than its end. At forecast origin `t` we generally do not know `Y_t`, and we may not know the status of the last year or more, particularly after a recession has begun and its end is still unannounced.
+
+Consequences for the design:
+
+1. **No lagged recession indicators as predictors.** Lags of `Y` or `USREC` would use information that was not available at the origin. The models are static (predictors are lagged macro/financial data only).
+2. **Training labels must respect announcement dates.** A training row `k` with target `Y_h` uses recession status in months `k+1, ..., k+h`; it may enter the training set at origin `t` only if the status of month `k+h` was already known at `t`. Ignoring the delay, or ignoring that peaks and troughs are announced at different speeds, leaks future information into estimation.
+
+# 5. Forecast design and diagnostics
+
+The first out-of-sample forecast is January 1986. Each forecast is re-estimated on an expanding window. At forecast origin `t`, the end of the training window is set by a **label-availability rule**:
+
+* `Practical` (headline): if the last announced turning point is a peak, the economy is in a recession whose end is unknown, so labels are known only through the peak month. If it is a trough, any new peak would (historically) have been announced within `D_peak` months, so labels are known through `t - D_peak`.
+* `Strict`: labels are known only through the most recent announced turning point.
+* `Constant_18`: a uniform 18-month label delay (the sensitivity analysis from the LASSO draft). Ignores announcement asymmetry.
+* `Original`: no delay (training labels end at `t - h - 1`). This is the version 1 baseline. It is **leaky** and is kept only to show how much performance is overstated when announcement delays are ignored, and to compare with earlier results.
+
+An announcement is treated as available at origin `t` if it occurred before the first day of month `t+1` (FRED-MD data for month `t` are released early in month `t+1`). This does not fix delays in the release or revision of the predictors. `D_peak` is calibrated on the full announcement history, which is a mild look-ahead. A larger value is a more conservative sensitivity check.
+
+```{r design}
+test_start <- as.Date("1986-01-01")
+horizons <- c(3, 6, 12)
+
+# label-availability rules: "rule" picks the logic, "delay" is only used when rule = "constant"
+label_configs <- tribble(
+  ~label_rule,   ~rule,        ~delay,
+  "Practical",   "practical",  0L,
+  "Strict",      "strict",     0L,
+  "Constant_18", "constant",   18L,
+  "Original",    "constant",   0L
+)
+
+# exclude non predictor columns
+excluded <- c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+
+datasets <- list(Macro = macro, Macro_Financial = macro_fin)
+
+# predictor dataset check
+predictor_summary <- bind_rows(lapply(names(datasets), function(nm) {
+  df <- datasets[[nm]]
+  xcols <- setdiff(names(df), excluded)
+  data.frame(dataset = nm, predictors = length(xcols),
+             missing_predictor_cells = sum(is.na(df[, xcols, drop = FALSE])),
+             recession_months = sum(df$USREC == 1, na.rm = TRUE))
+}))
+kable(predictor_summary)
+```
+
+```{r label-availability}
+# Last month whose recession status is known at forecast origin `origin`
+known_through <- function(origin, rule = c("practical", "strict"), D_peak_months = D_peak) {
+  rule <- match.arg(rule)
+  available <- origin %m+% months(1)
+  announced_tp <- turning_points %>% filter(announced < available)
+  if (nrow(announced_tp) == 0L) return(as.Date(NA))
+  last_tp <- announced_tp %>% slice_max(tp_month, n = 1, with_ties = FALSE)
+  if (rule == "strict" || last_tp$type == "peak") return(last_tp$tp_month)
+  max(last_tp$tp_month, origin %m+% months(-D_peak_months))
+}
+
+# Last training row whose label Y_h is fully known at the origin in row i
+get_end_idx <- function(df, i, horizon, rule, delay = 0L) {
+  # "constant" = old fixed-lag logic (Original with delay 0, Constant_18 with delay 18)
+  if (rule == "constant") return(i - horizon - 1L - delay)
+  kt <- known_through(df$sasdate[i], rule)
+  if (is.na(kt)) return(0L)
+  # Row k has label built from months k+1, ..., k+h, so month k+h must be known
+  ok <- which(df$sasdate %m+% months(horizon) <= kt)
+  if (length(ok) == 0L) return(0L)
+  min(max(ok), i - 1L)
+}
+```
+
+Diagnostic: the last usable training label and the number of positive training labels at selected origins (h = 12). With realistic announcement lags, the training window can end years before the origin.
+
+```{r label-diagnostics}
+diag_origins <- as.Date(c("1986-01-01", "1995-01-01", "2005-01-01", "2010-01-01", "2015-01-01"))
+
+label_diagnostics <- bind_rows(lapply(seq_len(nrow(label_configs)), function(k) {
+  cfg <- label_configs[k, ]
+  bind_rows(lapply(diag_origins, function(d) {
+    i <- which(macro$sasdate == d)
+    if (length(i) != 1L) return(NULL)
+    e <- get_end_idx(macro, i, 12, cfg$rule, cfg$delay)
+    data.frame(label_rule = cfg$label_rule, origin = d,
+               last_label_row = if (e >= 1L) macro$sasdate[e] else as.Date(NA),
+               n_train_rows = max(e, 0L),
+               positive_labels = if (e >= 1L) sum(macro$Y_12[seq_len(e)], na.rm = TRUE) else 0L)
+  }))
+}))
+kable(label_diagnostics)
+```
+
+# 6. Static binary response models
+
+The Logit and Probit specifications are unpenalised maximum-likelihood GLMs using all available predictors. Unlike LASSO, they do not perform variable selection. With many FRED-MD predictors and relatively few observations early on, some fits may be unidentified or show separation. Such forecasts are flagged as failed (`NA`) rather than silently treated as valid.
+
+```{r fit-functions}
+get_predictors <- function(df) {
+  setdiff(names(df), excluded)
+}
+
+fit_binary <- function(train_data, predictor_cols, horizon, model = c("Logit", "Probit")) {
+  model <- match.arg(model)
+  target <- paste0("Y_", horizon)
+
+  # keep only rows with a complete target and complete predictors
+  train_data <- train_data[complete.cases(train_data[, c(target, predictor_cols), drop = FALSE]), , drop = FALSE]
+
+  # return NULL if there are fewer than 50 usable rows, if the target has only one class
+  # (no recessions yet in training) or if there are no predictors
+  if (nrow(train_data) < 50 || length(unique(train_data[[target]])) < 2L)
+    return(NULL)
+  if (length(predictor_cols) == 0L) return(NULL)
+
+  # check numeric
+  x <- as.matrix(train_data[, predictor_cols, drop = FALSE])
+  if (!all(vapply(train_data[, predictor_cols, drop = FALSE], is.numeric, logical(1))))
+    stop("Predictors must be numeric")
+
+  # reject if more parameters than observations or if perfectly collinear
+  design <- cbind(`(Intercept)` = 1, x)
+  if (ncol(design) >= nrow(design) || qr(design)$rank < ncol(design)) return(NULL)
+
+  link <- if (model == "Logit") "logit" else "probit"
+  formula <- reformulate(predictor_cols, response = target)
+
+  # fits the unpenalised maximum-likelihood GLM, allowing up to 100 iterations
+  fitted <- tryCatch(
+    suppressWarnings(glm(formula, data = train_data,
+                         family = binomial(link = link),
+                         control = glm.control(maxit = 100))),
+    error = function(e) NULL
+  )
+
+  # rejects the fit if it failed, did not converge or has NA/infinite coefficients
+  if (is.null(fitted) || !isTRUE(fitted$converged) ||
+      anyNA(coef(fitted)) || any(!is.finite(coef(fitted)))) return(NULL)
+
+  fitted
+}
+```
+
+# 7. Expanding-window out-of-sample forecasts
+
+Each test observation is predicted using contemporaneous indicators and only training labels that were available at the forecast origin under the chosen label-availability rule. We drop missing predictor rows rather than imputing with future information. The same test dates must be used for model comparisons, so we use paired-date checks.
+
+```{r forecast-function}
+forecast_binary <- function(df, horizon, model,
+                            test_start = as.Date("1986-01-01"),
+                            rule = "practical", delay = 0L) {
+  df <- arrange(df, sasdate)
+  target <- paste0("Y_", horizon)
+  predictors <- get_predictors(df)
+  test_idx <- which(df$sasdate >= test_start & !is.na(df[[target]]))
+  output <- vector("list", length(test_idx))
+
+  # loops over each test date i
+  for (j in seq_along(test_idx)) {
+    i <- test_idx[j]
+
+    # last training row whose label was known at origin i (see get_end_idx)
+    end_idx <- get_end_idx(df, i, horizon, rule, delay)
+    prob <- NA_real_
+
+    # only proceeds if there is training data and the predictors at the test date are all observed
+    if (end_idx >= 1L &&
+        all(complete.cases(df[i, predictors, drop = FALSE]))) {
+      train <- df[seq_len(end_idx), , drop = FALSE]
+      fit <- fit_binary(train, predictors, horizon, model)
+      if (!is.null(fit)) {
+        prob <- tryCatch(
+          as.numeric(predict(fit, newdata = df[i, , drop = FALSE],
+                             type = "response")),
+          error = function(e) NA_real_
+        )
+        if (length(prob) != 1L || !is.finite(prob)) prob <- NA_real_
+      }
+    }
+    output[[j]] <- data.frame(sasdate = df$sasdate[i], horizon = horizon,
+                              model = model, actual = df[[target]][i],
+                              predicted_prob = prob,
+                              train_rows = max(end_idx, 0L))
+  }
+  bind_rows(output)
+}
+```
+
+Note: `cache=TRUE` in the chunk header means knitr skips re-running the chunk below unless the code changes. There are now 4 label rules x 2 datasets x 3 horizons x 2 models = 48 runs, so expect roughly four times the earlier run time. To run only some rules (e.g. `Practical` first), edit `run_rules`.
+
+```{r run-forecasts, cache=TRUE}
+# choose which label rules to run, e.g. c("Practical") for a quick first pass
+run_rules <- label_configs$label_rule
+
+all_forecasts <- list()
+for (k in seq_len(nrow(label_configs))) {
+  cfg <- label_configs[k, ]
+  if (!cfg$label_rule %in% run_rules) next
+  for (dataset_name in names(datasets)) {
+    for (h in horizons) {
+      for (model_name in c("Logit", "Probit")) {
+        cat("Running:", cfg$label_rule, dataset_name, h, model_name, "\n")
+        result <- forecast_binary(datasets[[dataset_name]], h, model_name,
+                                  test_start, cfg$rule, cfg$delay)
+        result$dataset <- dataset_name
+        result$label_rule <- cfg$label_rule
+        all_forecasts[[paste(cfg$label_rule, dataset_name, h, model_name, sep = "_")]] <- result
+      }
+    }
+  }
+}
+forecast_results <- bind_rows(all_forecasts)
+
+forecast_results %>% group_by(label_rule, dataset, horizon, model) %>%
+  summarise(test_rows = n(), valid_forecasts = sum(is.finite(predicted_prob)),
+            failed_forecasts = sum(!is.finite(predicted_prob)),
+            median_train_rows = median(train_rows), .groups = "drop") %>% kable()
+```
+
+# 8. Out-of-sample evaluation
+
+AUC evaluates ranking performance; F1 evaluates binary classification at the pre-specified threshold of 0.5; balanced accuracy and Brier score provide complementary diagnostics. If either class is absent or no valid forecasts exist, the affected metric is `NA`. **Do not compare configurations with different valid test dates.** The headline results are the `Practical` rows. The other rules are sensitivity checks.
+
+```{r evaluation-functions}
+# keep only valid forecasts
+evaluate_forecasts <- function(df, threshold = 0.5) {
+  df <- df %>% filter(is.finite(predicted_prob), !is.na(actual))
+  if (nrow(df) == 0) return(data.frame(n = 0L, AUC = NA_real_, F1 = NA_real_,
+                                       Balanced_Accuracy = NA_real_, Brier = NA_real_))
+  actual <- df$actual
+  prob <- df$predicted_prob
+
+  # convert to 0/1 class predictions using the 0.5 cutoff
+  pred <- as.integer(prob >= threshold)
+
+  # confusion matrix
+  tp <- sum(pred == 1 & actual == 1)
+  tn <- sum(pred == 0 & actual == 0)
+  fp <- sum(pred == 1 & actual == 0)
+  fn <- sum(pred == 0 & actual == 1)
+
+  # Precision: share of predicted recessions that were real (0 if the model never predicted one)
+  # Recall: share of real recession-window months caught (NA if there are no positives)
+  # Specificity: share of non-recession months correctly identified
+  precision <- if (tp + fp == 0) 0 else tp / (tp + fp)
+  recall <- if (tp + fn == 0) NA_real_ else tp / (tp + fn)
+  specificity <- if (tn + fp == 0) NA_real_ else tn / (tn + fp)
+
+  # F1 is the harmonic mean of precision and recall
+  f1 <- if (is.na(recall)) NA_real_ else if (precision + recall == 0) 0 else
+    2 * precision * recall / (precision + recall)
+
+  # AUC: how well probabilities rank recession months above non-recession months
+  # (NA if only one class is present; direction = "<" means higher probability = positive class)
+  auc_val <- if (length(unique(actual)) < 2) NA_real_ else
+    as.numeric(pROC::auc(pROC::roc(actual, prob, quiet = TRUE, direction = "<")))
+
+  data.frame(n = nrow(df), AUC = auc_val, F1 = f1,
+             Balanced_Accuracy = (recall + specificity) / 2,
+             Brier = mean((actual - prob)^2))
+}
+
+evaluation_results <- forecast_results %>%
+  group_by(label_rule, dataset, horizon, model) %>%
+  group_modify(~ evaluate_forecasts(.x)) %>% ungroup()
+kable(evaluation_results, digits = 4)
+```
+
+## Cost of ignoring announcement delays
+
+The leaky `Original` configuration is compared with the `Practical` rule on the **same valid test dates**. Large gaps indicate performance that would be overstated if announcement delays were ignored. (Requires both rules to be in `run_rules`.)
+
+```{r leakage-gap}
+leakage_gap <- forecast_results %>%
+  filter(label_rule %in% c("Original", "Practical")) %>%
+  select(sasdate, horizon, model, dataset, label_rule, actual, predicted_prob) %>%
+  pivot_wider(names_from = label_rule, values_from = predicted_prob) %>%
+  filter(is.finite(Original), is.finite(Practical)) %>%
+  group_by(dataset, horizon, model) %>%
+  group_modify(~ {
+    original_eval <- evaluate_forecasts(data.frame(actual = .x$actual,
+                                                   predicted_prob = .x$Original))
+    practical_eval <- evaluate_forecasts(data.frame(actual = .x$actual,
+                                                    predicted_prob = .x$Practical))
+    data.frame(n_paired = nrow(.x),
+               AUC_original = original_eval$AUC, AUC_practical = practical_eval$AUC,
+               AUC_drop = original_eval$AUC - practical_eval$AUC,
+               Brier_original = original_eval$Brier, Brier_practical = practical_eval$Brier)
+  }) %>% ungroup()
+kable(leakage_gap, digits = 4)
+```
+
+# 9. Incremental financial-market predictive value
+
+Compare Macro and Macro + Financial on **paired valid forecast dates**, not different subsamples. Positive AUC/F1 gains and positive Brier improvement indicate benefits from financial indicators.
+
+```{r paired-comparison}
+paired_forecasts <- forecast_results %>%
+  select(sasdate, horizon, model, label_rule, dataset, actual, predicted_prob) %>%
+  pivot_wider(names_from = dataset,
+              values_from = c(actual, predicted_prob)) %>%
+  filter(is.finite(predicted_prob_Macro),
+         is.finite(predicted_prob_Macro_Financial)) %>%
+  mutate(actual = actual_Macro) %>%
+  filter(actual_Macro == actual_Macro_Financial)   # both datasets must agree on the outcome
+
+# AUC, F1, balanced accuracy: positive = financial variables help
+# Brier difference is Macro minus Financial (lower Brier is better), so positive also = financial help
+paired_metrics <- paired_forecasts %>%
+  group_by(label_rule, horizon, model) %>%
+  group_modify(~ {
+    macro_eval <- evaluate_forecasts(data.frame(actual = .x$actual,
+                                                predicted_prob = .x$predicted_prob_Macro))
+    fin_eval <- evaluate_forecasts(data.frame(actual = .x$actual,
+                                              predicted_prob = .x$predicted_prob_Macro_Financial))
+    data.frame(n_paired = nrow(.x),
+               AUC_gain = fin_eval$AUC - macro_eval$AUC,
+               F1_gain = fin_eval$F1 - macro_eval$F1,
+               Balanced_Accuracy_gain = fin_eval$Balanced_Accuracy - macro_eval$Balanced_Accuracy,
+               Brier_improvement = macro_eval$Brier - fin_eval$Brier)
+  }) %>% ungroup()
+kable(paired_metrics, digits = 4)
+```
+
+# 10. Save forecasts for cross-model comparisons
+
+```{r save-results}
+dir.create("../results", recursive = TRUE, showWarnings = FALSE)
+write_csv(turning_points, "../results/nber_turning_points_announcements.csv")
+write_csv(forecast_results, "../results/static_probit_logit_forecasts.csv")
+write_csv(evaluation_results, "../results/static_probit_logit_evaluation.csv")
+write_csv(leakage_gap, "../results/static_probit_logit_leakage_gap.csv")
+write_csv(paired_metrics, "../results/static_probit_logit_financial_comparison.csv")
+```
+
+# 11. Notes for the report
+
+1. **Forecast target:** whether a recession occurs at least once within the next 3, 6 or 12 months (within-horizon). A recession already under way at the origin counts as a positive.
+2. **Identification:** an unpenalised GLM with all FRED-MD columns can fail because of too few observations relative to predictors, multicollinearity, or separation. Failed forecasts are reported as `NA`, not silently regularised.
+3. **Information timing (labels):** NBER announcement delays differ for peaks and troughs. Training labels are restricted to those announced by the forecast origin (`Practical` headline; `Strict` and `Constant_18` as sensitivity checks; `Original` is the leaky baseline). Pre-1980 announcement dates are assumed, and `D_peak` is calibrated on the full history (a mild look-ahead).
+4. **Information timing (predictors):** revised FRED-MD data may not reflect what was available in real time. These rules are not a full real-time vintage reconstruction.
+5. **Fair comparisons:** all models must use the same target, test dates, label rule and threshold. Diebold-Mariano style tests should use paired losses with serial-correlation-robust inference because forecast windows overlap.
