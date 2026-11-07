@@ -19,28 +19,32 @@ set.seed(1213)
 
 # 2. Load data
 
-Use the same processed files and predictors as the group's LASSO implementation. Run this Rmd from the same directory as the LASSO Rmd.
-
 ```{r load-data}
 macro <- read_csv("../data/processed/fred_md_macro_clean_final.csv", show_col_types = FALSE)
 macro_fin <- read_csv("../data/processed/fred_md_macro_financial_clean_final.csv", show_col_types = FALSE)
 
+# data cleaning 
 macro <- macro %>% mutate(sasdate = as.Date(sasdate)) %>% arrange(sasdate)
 macro_fin <- macro_fin %>% mutate(sasdate = as.Date(sasdate)) %>% arrange(sasdate)
+
+# data check if all columns present and no duplicates present
 stopifnot(all(c("sasdate", "USREC") %in% names(macro)),
           all(c("sasdate", "USREC") %in% names(macro_fin)),
           !anyDuplicated(macro$sasdate), !anyDuplicated(macro_fin$sasdate))
 
+# check dataset
 kable(data.frame(dataset = c("Macro", "Macro_Financial"),
                  rows = c(nrow(macro), nrow(macro_fin)),
                  columns = c(ncol(macro), ncol(macro_fin))))
 ```
 
-# 3. Construct targets (same as LASSO)
+# 3. Construct targets 
 
-For horizon `h`, `Y_h` equals 1 if **any** of the following `h` months is classified as a recession by the NBER chronology; otherwise it equals 0. This is *within-horizon* forecasting, not the probability of a recession precisely at month `t+h`.
+For horizon `h`, `Y_h` equals 1 if any of the following `h` months is classified as a recession by the NBER chronology. Otherwise it equals 0. This is within-horizon forecasting, not the probability of a recession precisely at month `t+h`.
 
 ```{r targets}
+
+
 create_targets <- function(df, horizons = c(3, 6, 12)) {
   df <- arrange(df, sasdate)
   for (h in horizons) {
@@ -55,6 +59,8 @@ create_targets <- function(df, horizons = c(3, 6, 12)) {
   }
   df
 }
+
+# whether a recession starts or occurs at any point in the next h months, not whether month t+h itself is a recessiion
 macro <- create_targets(macro)
 macro_fin <- create_targets(macro_fin)
 
@@ -65,16 +71,19 @@ macro %>%
 
 # 4. Forecast design and diagnostics
 
-The first out-of-sample forecast is January 1986. Each forecast is re-estimated on an expanding window. At forecast origin `t`, we only use training rows whose entire future target window ends **before** `t`. Set `announcement_delay_months` to 18 for a conservative *label-availability sensitivity analysis*, as discussed in the LASSO draft; zero is the directly comparable baseline. This does not fix delays in the release or revision of predictors.
+The first out-of-sample forecast is January 1986. Each forecast is re-estimated on an expanding window. At forecast origin `t`, we only use training rows whose entire future target window ends before `t`. Set `announcement_delay_months` to 18 for a conservative label-availability sensitivity analysis. Zero is the directly comparable baseline. This does not fix delays in the release or revision of predictors.
 
 ```{r design}
+
 test_start <- as.Date("1986-01-01")
 horizons <- c(3, 6, 12)
 announcement_delay_months <- 0L
+# exclude non predictor columns
 excluded <- c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
 
 datasets <- list(Macro = macro, Macro_Financial = macro_fin)
 
+# predictor dataset check
 predictor_summary <- bind_rows(lapply(names(datasets), function(nm) {
   df <- datasets[[nm]]
   xcols <- setdiff(names(df), excluded)
@@ -87,50 +96,61 @@ kable(predictor_summary)
 
 # 5. Static binary response models
 
-The Logit and Probit specifications are unpenalised maximum-likelihood GLMs with identical predictors. Unlike LASSO, they do not perform variable selection. With many FRED-MD predictors and relatively few pre-1986 observations, some designs may be unidentified or produce separation; such forecasts are flagged rather than silently treated as valid. For a stable conventional baseline, use a *pre-specified small set* of predictors in both datasets (e.g., via `selected_predictors` below), chosen before examining test performance. The default `NULL` attempts all predictors and reports failures.
-
 ```{r fit-functions}
-# Optional: enter a pre-specified, small set of column names common to the files.
-# NULL = use all available predictors (may be infeasible for unpenalised GLMs).
-selected_predictors <- NULL
 
 get_predictors <- function(df) {
-  available <- setdiff(names(df), excluded)
-  if (is.null(selected_predictors)) return(available)
-  intersect(selected_predictors, available)
+  setdiff(names(df), excluded)
 }
 
 fit_binary <- function(train_data, predictor_cols, horizon, model = c("Logit", "Probit")) {
   model <- match.arg(model)
   target <- paste0("Y_", horizon)
+
+  # keep only rows with a complete target and complete predictors
   train_data <- train_data[complete.cases(train_data[, c(target, predictor_cols), drop = FALSE]), , drop = FALSE]
+
+  
+  # return NULL if there are fewer than 50 usable rows, if the target has only one class (no recessions yet in training) or if there are no predictors
   if (nrow(train_data) < 50 || length(unique(train_data[[target]])) < 2L)
     return(NULL)
   if (length(predictor_cols) == 0L) return(NULL)
+
+  # check numeric
   x <- as.matrix(train_data[, predictor_cols, drop = FALSE])
   if (!all(vapply(train_data[, predictor_cols, drop = FALSE], is.numeric, logical(1))))
-    stop("Predictors must be numeric; check cleaned input files.")
+    stop("Predictors must be numeric")
+
+  # reject if more parameters than observations or if perfectly collinear
+  # adds an intercept column to form the design matrix
   design <- cbind(`(Intercept)` = 1, x)
   if (ncol(design) >= nrow(design) || qr(design)$rank < ncol(design)) return(NULL)
+
   link <- if (model == "Logit") "logit" else "probit"
   formula <- reformulate(predictor_cols, response = target)
+
+  # fits the unpenalised maximum-likelihood GLM, allowing up to 100 iterations
   fitted <- tryCatch(
     suppressWarnings(glm(formula, data = train_data,
                          family = binomial(link = link),
                          control = glm.control(maxit = 100))),
     error = function(e) NULL
   )
+
+  # rejects the fit if the fit failed, did not converge or has NA or infinite coefficients, else it returns the fitted model
   if (is.null(fitted) || !isTRUE(fitted$converged) ||
       anyNA(coef(fitted)) || any(!is.finite(coef(fitted)))) return(NULL)
+
   fitted
 }
 ```
 
 # 6. Expanding-window out-of-sample forecasts
 
-Each test observation is predicted using contemporaneous indicators and only historically eligible training labels. We drop missing predictor rows rather than imputing with future information. The same test dates must be used for model comparisons; see the paired-date checks below.
+Each test observation is predicted using contemporaneous indicators and only historically eligible training labels. We drop missing predictor rows rather than imputing with future information. The same test dates must be used for model comparisons so we use paired-date checks.
 
 ```{r forecast-function}
+
+# sets up the target and predictors
 forecast_binary <- function(df, horizon, model,
                             test_start = as.Date("1986-01-01"),
                             announcement_delay_months = 0L) {
@@ -139,12 +159,14 @@ forecast_binary <- function(df, horizon, model,
   predictors <- get_predictors(df)
   test_idx <- which(df$sasdate >= test_start & !is.na(df[[target]]))
   output <- vector("list", length(test_idx))
+  # Llops over each test date i
   for (j in seq_along(test_idx)) {
     i <- test_idx[j]
-    # Training outcome must be observed before forecast origin.
-    # For monthly rows, i - h - 1 is the last strictly prior completed label.
+    # training outcome must be observed before forecast origin
+    # monthly rows, i - h - 1 is the last strictly prior completed label
     end_idx <- i - horizon - 1L - announcement_delay_months
     prob <- NA_real_
+    # olnly proceeds if there is some training data and the predictors at the test date are all observed, then takes expanding window and fits the model
     if (end_idx >= 1L &&
         all(complete.cases(df[i, predictors, drop = FALSE]))) {
       train <- df[seq_len(end_idx), , drop = FALSE]
@@ -166,7 +188,12 @@ forecast_binary <- function(df, horizon, model,
 }
 ```
 
+
+Note: cache=TRUE in the chunk header means knitr skips re-running this chunk below unless the code changes.
+
 ```{r run-forecasts, cache=TRUE}
+
+# run all at once (takes 15-20 mins)
 all_forecasts <- list()
 for (dataset_name in names(datasets)) {
   for (h in horizons) {
@@ -191,6 +218,8 @@ forecast_results %>% group_by(dataset, horizon, model) %>%
 AUC evaluates ranking performance; F1 evaluates binary classification at the pre-specified threshold of 0.5; balanced accuracy and Brier score provide complementary diagnostics. If either class is absent or no valid forecasts exist, the affected metric is `NA`. **Do not compare configurations with different valid test dates.**
 
 ```{r evaluation-functions}
+
+# keep only valid forecasts
 evaluate_forecasts <- function(df, threshold = 0.5) {
   df <- df %>% filter(is.finite(predicted_prob), !is.na(actual))
   if (nrow(df) == 0) return(data.frame(n = 0L, AUC = NA_real_, F1 = NA_real_,
@@ -198,15 +227,30 @@ evaluate_forecasts <- function(df, threshold = 0.5) {
   actual <- df$actual
   prob <- df$predicted_prob
   pred <- as.integer(prob >= threshold)
+  
+  # convert to to 0/1 class predictions using the 0.5 cutoff.
   tp <- sum(pred == 1 & actual == 1)
   tn <- sum(pred == 0 & actual == 0)
   fp <- sum(pred == 1 & actual == 0)
   fn <- sum(pred == 0 & actual == 1)
+  
+  
+  # confusion matrix calculations for eval
+  # Precision is the share of predicted recessions that were real (set to 0 if the model never predicted a recession)
+  # Recall (sensitivity) is the share of real recession-window months caught () NA if there are no positives)
+  # Specificity is the share of non-recession months correctly identified
+  
   precision <- if (tp + fp == 0) 0 else tp / (tp + fp)
   recall <- if (tp + fn == 0) NA_real_ else tp / (tp + fn)
   specificity <- if (tn + fp == 0) NA_real_ else tn / (tn + fp)
+  
+  # F1 is the harmonic mean of precision and recall
   f1 <- if (is.na(recall)) NA_real_ else if (precision + recall == 0) 0 else
     2 * precision * recall / (precision + recall)
+  
+  # AUC measures how well probabilities rank recession months above non-recession months (NA if only one class is present. direction = "<" says that higher probabilities mean the positive class.)
+  
+  
   auc_val <- if (length(unique(actual)) < 2) NA_real_ else
     as.numeric(pROC::auc(pROC::roc(actual, prob, quiet = TRUE, direction = "<")))
   data.frame(n = nrow(df), AUC = auc_val, F1 = f1,
@@ -222,7 +266,7 @@ kable(evaluation_results, digits = 4)
 
 # 8. Incremental financial-market predictive value
 
-Compare Macro and Macro + Financial on **paired valid forecast dates**, not different subsamples. Positive AUC/F1 gains and positive Brier improvement indicate benefits from financial indicators.
+Compare Macro and Macro + Financial on paired valid forecast dates, not different subsamples. Positive AUC/F1 gains and positive Brier improvement indicate benefits from financial indicators.
 
 ```{r paired-comparison}
 paired_forecasts <- forecast_results %>%
@@ -233,6 +277,11 @@ paired_forecasts <- forecast_results %>%
          is.finite(predicted_prob_Macro_Financial)) %>%
   mutate(actual = actual_Macro) %>%
   filter(actual_Macro == actual_Macro_Financial)
+
+
+# single actual column and checks that both datasets agree on the outcome
+# for AUC, F1 and balanced accuracy, a positive value means financial variables help
+# Brier difference is reversed (Macro minus Financial) because lower Brier is better, so a positive value also means financial variables help.
 
 paired_metrics <- paired_forecasts %>%
   group_by(horizon, model) %>%
@@ -259,17 +308,4 @@ write_csv(evaluation_results, "../results/static_probit_logit_evaluation.csv")
 write_csv(paired_metrics, "../results/static_probit_logit_financial_comparison.csv")
 ```
 
-# 10. Methodological notes for the report
 
-1. **Forecast target:** This implementation forecasts whether a recession occurs at least once within the next 3, 6 or 12 months. It does not estimate Chauvet–Potter hitting probabilities or exact-horizon recession status.
-2. **Identification:** An unpenalised GLM with all FRED-MD columns may fail because the initial sample has too few observations relative to predictors, because of multicollinearity, or because of complete/quasi-complete separation. The code reports missing forecasts rather than quietly regularising the baseline. A pre-specified parsimonious predictor set is recommended for meaningful static benchmarks.
-3. **Information timing:** Historical NBER recession labels were dated retrospectively, and revised FRED-MD observations may not reflect information available in real time. The optional 18-month training-label delay is a sensitivity check, not a full real-time vintage reconstruction. Also ensure that the transformed predictors are aligned to their actual publication dates.
-4. **Fair comparisons:** Compare models using the same target definition, forecast dates, release assumptions, and pre-specified classification threshold. For statistical forecast comparisons, a Diebold–Mariano-style test should use paired losses (e.g., Brier losses) with serial-correlation-robust inference because forecast windows overlap.
-
-# References
-
-Estrella, A., & Mishkin, F. S. (1998). Predicting U.S. recessions: Financial variables as leading indicators. *Review of Economics and Statistics, 80*(1), 45–61.
-
-Kauppi, H., & Saikkonen, P. (2008). Predicting U.S. recessions with dynamic binary response models. *Review of Economics and Statistics, 90*(4), 777–791.
-
-Vrontos, S. D., Galakis, J., & Vrontos, I. D. (2021). Modeling and predicting U.S. recessions using machine learning techniques. *International Journal of Forecasting, 37*(2), 647–671.
