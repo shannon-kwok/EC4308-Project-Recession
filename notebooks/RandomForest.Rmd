@@ -116,7 +116,7 @@ macro_fin %>%
 
 ## 4. Random Forest and Bagging
 
-Here, we use an expanding window (same as other models). At each forecast date, the model is trained on all rows whose target period has already ended, then predict using that month's indicators. 
+Here, we use an expanding window (same as other models). At each forecast date, the model is trained on all rows whose target period has already ended, then predict using that month's indicators. It is retrained every 1 month.
 
 We try both Random Forest and Bagging. Bagging is a random forest with `mtry = p`. We run our first pass with 500 trees, `mtry = floor(sqrt(p))` for RF, with no tuning.
 
