@@ -1,602 +1,258 @@
 ---
-title: "Naive Bayes Recession Forecasting"
+title: "Naive Bayes"
+author: "Javier"
 output:
   html_document:
     toc: true
     toc_depth: 2
-    number_sections: true
+    number_sections: false
+    self_contained: true
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE, cache=FALSE)
 ```
 
-## Naive Bayes models
+## 1. Packages and data
 
-```{r section_1, echo=TRUE}
-# Models:
-#   1. Macroeconomic indicators only
-#   2. Macroeconomic + financial indicators
-# Forecast horizons: 3, 6, 12 months
-# Evaluation metrics: AUC and F1 Score
-```
-
-## Packages
-
-```{r section_2, echo=TRUE}
-packages <- c(
-  "readr",
-  "dplyr",
-  "tidyr",
-  "lubridate",
-  "e1071",
-  "pROC",
-  "ggplot2"
-)
-
-missing_packages <- setdiff(
-  packages,
-  rownames(installed.packages())
-)
-
-if (length(missing_packages) > 0) {
-  install.packages(missing_packages)
-}
-
-invisible(
-  lapply(packages, library, character.only = TRUE)
-)
-
+```{r packages}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(e1071)
+library(pROC)
+library(knitr)
+library(ggplot2)
 set.seed(1213)
 ```
 
-## Configuration
-
-```{r section_3, echo=TRUE}
-
-HORIZONS <- c(3, 6, 12)
-
-# Chronological split:
-# Initial training target dates: before January 1980
-# Validation target dates: January 1980 - December 1985
-# Final model training target dates: before January 1986
-# OOS forecast origins: January 1986 onward
-# Four episodes before 1986, four from 1986 onward.
-
-VALIDATION_START <- as.Date("1980-01-01")
-TEST_START <- as.Date("1986-01-01")
-
-# Numerical stabilization for Gaussian Naive Bayes
-# To control for numerical instability if variance of predictor within a class is too small
-NB_EPSILON <- 1e-6
-
-# Main classification threshold (fixed baseline)
-FIXED_THRESHOLD <- 0.50
-
-# Candidate thresholds for validation-only robustness analysis
-THRESHOLD_GRID <- seq(
-  0.05,
-  0.95,
-  by = 0.01
-)
+```{r data}
+macro <- read_csv("../data/processed/fred_md_macro_clean_final.csv", show_col_types=FALSE) %>%
+  mutate(sasdate=as.Date(sasdate)) %>% arrange(sasdate) #Format Date
+macro_fin <- read_csv("../data/processed/fred_md_macro_financial_clean_final.csv", show_col_types=FALSE) %>%
+  mutate(sasdate=as.Date(sasdate)) %>% arrange(sasdate) #Format Date
+#Check Monthly Continuity
+month_index <- function(x) as.integer(format(x, "%Y"))*12L + as.integer(format(x, "%m"))
+stopifnot(all(diff(month_index(macro$sasdate)) == 1L))
 ```
 
-## Load Data
+## 2. Target: any recession within the next h months
 
-```{r section_4, echo=TRUE}
-# Load datasets directly
-macro_data <- read_csv(
-  "../data/processed/fred_md_macro_clean_final.csv",
-  show_col_types = FALSE
-)
+`Y_h` is 1 if any month from t+1 through t+h has USREC=1, and 0 otherwise. The last h observations have unknown targets and are excluded from evaluation.
 
-full_data <- read_csv(
-  "../data/processed/fred_md_macro_financial_clean_final.csv",
-  show_col_types = FALSE
-)
-
-# Ensure dates are correctly formatted
-macro_data <- macro_data %>%
-  mutate(sasdate = as.Date(sasdate))
-
-full_data <- full_data %>%
-  mutate(sasdate = as.Date(sasdate))
-
-# Identify predictors
-macro_predictors <- setdiff(
-  names(macro_data),
-  c("sasdate", "USREC")
-)
-
-full_predictors <- setdiff(
-  names(full_data),
-  c("sasdate", "USREC")
-)
-
-financial_predictors <- setdiff(
-  full_predictors,
-  macro_predictors
-)
-
-# Validate predictors
-if (!all(macro_predictors %in% full_predictors)) {
-  stop("Some macro predictors are absent from full dataset.")
+```{r targets}
+create_targets <- function(df) {
+  df <- arrange(df, sasdate)
+  for (h in c(3L, 6L, 12L)) {
+    y <- vapply(seq_len(nrow(df)), function(i) {
+      if (i + h > nrow(df)) return(NA_integer_)
+      future <- df$USREC[(i+1L):(i+h)]
+      if (anyNA(future)) return(NA_integer_)
+      as.integer(any(future == 1L))
+    }, integer(1))
+    df[[paste0("Y_", h)]] <- y
+  }
+  df
 }
-
-# Display predictor counts
-
-cat("\nNumber of macro predictors:",
-    length(macro_predictors))
-
-cat("\nNumber of financial predictors:",
-    length(financial_predictors))
-
-cat("\nTotal predictors in full model:",
-    length(full_predictors), "\n")
+macro <- create_targets(macro)
+macro_fin <- create_targets(macro_fin)
 ```
 
-## Create Forecast Target
+## 3. Gaussian Naive Bayes functions
 
-```{r section_5, echo=TRUE}
-# Y_t^(h) = USREC_(t+h)
-# Predict recession status exactly h months ahead.
+Predictor filtering and median imputation are fitted only on the eligible training sample at each forecast origin.
 
-create_target <- function(df, horizon) {
-  
-  df %>%
-    mutate(
-      target = lead(USREC, horizon),
-      target_date = sasdate %m+% months(horizon)
-    ) %>%
-    filter(!is.na(target))
-}
-```
-
-## Evaluation Metrics: F1 And Auc
-
-```{r section_6, echo=TRUE}
-calculate_metrics <- function(
-    actual,
-    probability,
-    threshold = 0.5
-) {
-  
-  predicted <- as.integer(
-    probability >= threshold
-  )
-  
-  TP <- sum(predicted == 1 & actual == 1)
-  FP <- sum(predicted == 1 & actual == 0)
-  FN <- sum(predicted == 0 & actual == 1)
-  
-  # F1 Score
-  denominator <- 2 * TP + FP + FN
-  
-  f1 <- if (denominator == 0) {
-    0
-  } else {
-    2 * TP / denominator
-  }
-  
-  # AUC
-  auc_value <- if (
-    length(unique(actual)) == 2
-  ) {
-    
-    roc_obj <- pROC::roc(
-      response = actual,
-      predictor = probability,
-      levels = c(0, 1),
-      direction = "<",
-      quiet = TRUE
-    )
-    
-    as.numeric(
-      pROC::auc(roc_obj)
-    )
-    
-  } else {
-    NA_real_
-  }
-  
-  data.frame(
-    AUC = auc_value,
-    F1 = f1
-  )
-}
-```
-
-## Robustness Check: Validation-Optimized Threshold
-
-```{r section_7, echo=TRUE}
-# Main results use FIXED_THRESHOLD = 0.50.
-# This alternative threshold is selected using validation F1 only.
-# OOS test observations are not used to select thresholds.
-
-optimize_threshold <- function(
-    actual,
-    probability
-) {
-  
-  scores <- sapply(
-    THRESHOLD_GRID,
-    function(th) {
-      
-      calculate_metrics(
-        actual = actual,
-        probability = probability,
-        threshold = th
-      )$F1
-    }
-  )
-  
-  # If multiple thresholds tie, select the one
-  # closest to 0.5.
-  
-  best <- which(
-    scores == max(scores, na.rm = TRUE)
-  )
-  
-  best <- best[
-    which.min(
-      abs(THRESHOLD_GRID[best] - 0.5)
-    )
-  ]
-  
-  return(THRESHOLD_GRID[best])
-}
-```
-
-## Fit Gaussian Naive Bayes
-
-```{r section_8, echo=TRUE}
-fit_nb_model <- function(train, predictors) {
-  
-  x_train <- train[, predictors, drop = FALSE]
-  
-  # Keep predictors with sufficient finite observations
-  valid_vars <- predictors[
-    sapply(x_train, function(x) {
-      observed <- x[is.finite(x)]
-      length(observed) >= 2 &&
-        length(unique(observed)) > 1
-    })
-  ]
-  
-  if (length(valid_vars) == 0) {
-    stop("No usable predictors.")
-  }
-  
-  x_train <- x_train[, valid_vars, drop = FALSE]
-  
-  # Calculate medians using training data only
-  medians <- sapply(x_train, function(x) {
-    median(x[is.finite(x)])
-  })
-  
-  # Replace missing values with training medians
-  for (v in valid_vars) {
-    x_train[[v]][!is.finite(x_train[[v]])] <- medians[[v]]
-  }
-  
-  x_train$target <- factor(
-    train$target,
-    levels = c(0, 1)
-  )
-  
-  if (length(unique(train$target)) < 2) {
-    stop("Training data must contain both classes.")
-  }
-  
-  model <- e1071::naiveBayes(
-    target ~ .,
-    data = x_train,
-    laplace = 1,
-    threshold = NB_EPSILON,
-    eps = NB_EPSILON
-  )
-  
-  list(
-    model = model,
-    variables = valid_vars,
-    medians = medians
-  )
+```{r nb-functions}
+fit_nb <- function(train, predictors, epsilon=1e-6) {
+  x <- train[, predictors, drop=FALSE]
+  if (!all(vapply(x, is.numeric, logical(1)))) stop("Predictors must be numeric")
+  valid <- predictors[vapply(x, function(z) {
+    z <- z[is.finite(z)]
+    length(z) >= 2L && length(unique(z)) > 1L
+  }, logical(1))]
+  if (!length(valid)) stop("No usable predictors")
+  x <- x[, valid, drop=FALSE]
+  medians <- vapply(x, function(z) median(z[is.finite(z)]), numeric(1))
+  for (v in valid) x[[v]][!is.finite(x[[v]])] <- medians[[v]]
+  y <- factor(train$target, levels=c(0,1))
+  if (anyNA(y) || length(unique(y)) < 2L) stop("Both target classes required")
+  x$target <- y
+  fit <- e1071::naiveBayes(target ~ ., data=x, eps=epsilon, threshold=epsilon)
+  list(fit=fit, predictors=valid, medians=medians)
 }
 
 predict_nb <- function(fitted, newdata) {
-  
-  x <- newdata[
-    , fitted$variables,
-    drop = FALSE
-  ]
-  
-  # Replace missing values using TRAINING medians (Prevent Data Leakage)
-  for (v in fitted$variables) {
-    x[[v]][!is.finite(x[[v]])] <- fitted$medians[[v]]
-  }
-  
-  prob <- predict(
-    fitted$model,
-    newdata = x,
-    type = "raw"
-  )
-  
-  as.numeric(prob[, "1"])
+  x <- newdata[, fitted$predictors, drop=FALSE]
+  for (v in fitted$predictors) x[[v]][!is.finite(x[[v]])] <- fitted$medians[[v]]
+  as.numeric(predict(fitted$fit, newdata=x, type="raw")[, "1"])
 }
 ```
 
-## Train And Evaluate One Model
+## 4. Monthly expanding-window forecasts
 
-```{r section_9, echo=TRUE}
-run_nb <- function(
-    df,
-    horizon,
-    model_name
-) {
-  
-  data_h <- create_target(
-    df,
-    horizon
-  )
-  
-  predictors <- setdiff(
-    names(df),
-    c("sasdate", "USREC")
-  )
-  
-  # ----------------------------------------------------------
-  # A. INITIAL TRAINING / VALIDATION
-  # ----------------------------------------------------------
-  
-  train <- data_h %>%
-    filter(
-      target_date < VALIDATION_START
-    )
-  
-  validation <- data_h %>%
-    filter(
-      target_date >= VALIDATION_START,
-      target_date < TEST_START
-    )
-  
-  if (
-    nrow(train) == 0 ||
-    nrow(validation) == 0
-  ) {
-    stop("Training or validation sample is empty.")
-  }
-  
-  # Fit model on initial training data
-  initial_fit <- fit_nb_model(
-    train,
-    predictors
-  )
-  
-  # Validation probabilities
-  val_prob <- predict_nb(
-    initial_fit,
-    validation
-  )
-  
-  # Optimize F1 classification threshold
-  best_threshold <- optimize_threshold(
-    validation$target,
-    val_prob
-  )
-  
-  # ----------------------------------------------------------
-  # B. REFIT USING ALL PRE-OOS OBSERVATIONS
-  # ----------------------------------------------------------
-  
-  final_train <- data_h %>%
-    filter(
-      target_date < TEST_START
-    )
-  
-  final_fit <- fit_nb_model(
-    final_train,
-    predictors
-  )
-  
-  # ----------------------------------------------------------
-  # C. OUT-OF-SAMPLE TESTING
-  # ----------------------------------------------------------
-  
-  test <- data_h %>%
-    filter(
-      sasdate >= TEST_START
-    )
-  
-  if (nrow(test) == 0) {
-    stop("OOS test sample is empty.")
-  }
-  
-  # All final training targets end before the first test forecast origin.
-  stopifnot(max(final_train$target_date) < min(test$sasdate))
-  
-  # Predict OOS probabilities
-  test_prob <- predict_nb(
-    final_fit,
-    test
-  )
-  
-  # Main test predictions: fixed 0.50 threshold
-  test_pred <- as.integer(test_prob >= FIXED_THRESHOLD)
-  
-  # Primary evaluation: fixed-threshold F1 and threshold-independent AUC
-  metrics <- calculate_metrics(
-    actual = test$target,
-    probability = test_prob,
-    threshold = FIXED_THRESHOLD
-  )
-  
-  # Robustness check: validation-optimized threshold applied unchanged to test
-  robustness_metrics <- calculate_metrics(
-    actual = test$target,
-    probability = test_prob,
-    threshold = best_threshold
-  )
-  
-  metrics$Horizon <- horizon
-  metrics$Model <- model_name
-  metrics$Threshold <- FIXED_THRESHOLD
-  metrics$Optimized_Threshold <- best_threshold
-  metrics$F1_Optimized <- robustness_metrics$F1
-  metrics$Delta_F1_Optimized_vs_Fixed <- robustness_metrics$F1 - metrics$F1
-  metrics$Train_N <- nrow(final_train)
-  metrics$Validation_N <- nrow(validation)
-  metrics$Test_N <- nrow(test)
-  metrics$Predictors <- length(
-    final_fit$variables
-  )
-  
-  predictions <- data.frame(
-    date = test$sasdate,
-    target_date = test$target_date,
-    actual = test$target,
-    probability = test_prob,
-    predicted = test_pred,
-    horizon = horizon,
-    model = model_name
-  )
-  
-  list(
-    model = final_fit$model,
-    variables = final_fit$variables,
-    medians = final_fit$medians,
-    metrics = metrics,
-    predictions = predictions,
-    validation_threshold = best_threshold
-  )
-}
-```
+For forecast row i and horizon h, training rows end at i-h-1. It assumes completed historical recession labels are available without additional announcement delays. Models are refitted every month.
 
-## Train All Six Models
-
-```{r section_10, echo=TRUE}
-results <- list()
-
-for (h in HORIZONS) {
-  
-  # Model 1: Macroeconomic indicators only
-  results[[paste0("Macro_", h)]] <- run_nb(
-    macro_data,
-    horizon = h,
-    model_name = "Macro"
-  )
-  
-  # Model 2: Macroeconomic + financial indicators
-  results[[paste0("Full_", h)]] <- run_nb(
-    full_data,
-    horizon = h,
-    model_name = "Macro + Financial"
-  )
-}
-```
-
-## Combine Model Results
-
-```{r section_11, echo=TRUE}
-metrics_table <- bind_rows(
-  lapply(results, function(x) x$metrics)
-) %>%
-  select(
-    Horizon,
-    Model,
-    Predictors,
-    Train_N,
-    Validation_N,
-    Test_N,
-    Threshold,
-    AUC,
-    F1,
-    Optimized_Threshold,
-    F1_Optimized,
-    Delta_F1_Optimized_vs_Fixed
-  ) %>%
-  arrange(Horizon, Model)
-```
-
-## Incremental Value Of Financial Indicators
-
-```{r section_12, echo=TRUE}
-comparison <- metrics_table %>%
-  select(Horizon, Model, AUC, F1) %>%
-  pivot_wider(
-    names_from = Model,
-    values_from = c(AUC, F1)
-  ) %>%
-  mutate(
-    Delta_AUC =
-      `AUC_Macro + Financial` - AUC_Macro,
-    Delta_F1 =
-      `F1_Macro + Financial` - F1_Macro
-  ) %>%
-  select(Horizon, Delta_AUC, Delta_F1)
-
-# Add incremental value to the main metrics table
-metrics_table <- metrics_table %>%
-  left_join(comparison, by = "Horizon")
-
-knitr::kable(
-  metrics_table,
-  digits = 3,
-  caption = "Naive Bayes Out-of-Sample Model Performance"
-)
-```
-
-## Combine Out-Of-Sample Predictions
-
-```{r section_13, echo=TRUE}
-predictions_table <- bind_rows(
-  lapply(results, function(x) x$predictions)
-) %>%
-  arrange(horizon, model, date)
-```
-
-## Generate Roc Curves
-
-```{r section_14, echo=TRUE}
-create_roc_plot <- function(h) {
-  
-  horizon_data <- predictions_table %>%
-    filter(horizon == h)
-  
-  roc_list <- lapply(
-    split(horizon_data, horizon_data$model),
-    function(d) {
-      pROC::roc(
-        response = d$actual,
-        predictor = d$probability,
-        levels = c(0, 1),
-        direction = "<",
-        quiet = TRUE
-      )
+```{r forecast-function}
+forecast_nb <- function(df, horizon, refit_every=1L,
+                        test_start=as.Date("1986-01-01")) {
+  stopifnot(refit_every >= 1L, horizon %in% c(3L,6L,12L))
+  df <- arrange(df, sasdate)
+  target <- paste0("Y_", horizon)
+  predictors <- setdiff(names(df), c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample"))
+  test_indices <- which(df$sasdate >= test_start & !is.na(df[[target]]))
+  if (!length(test_indices)) stop("No eligible test observations")
+  output <- vector("list", length(test_indices))
+  fitted <- NULL
+  for (j in seq_along(test_indices)) {
+    i <- test_indices[j]
+    if ((j-1L) %% refit_every == 0L) {
+      last_train <- i - horizon - 1L
+      if (last_train < 1L) stop("Insufficient training history")
+      train <- df[seq_len(last_train), , drop=FALSE] %>%
+        filter(!is.na(.data[[target]])) %>%
+        mutate(target=.data[[target]])
+      fitted <- fit_nb(train, predictors)
     }
-  )
-  
-  pROC::ggroc(roc_list) +
-    geom_abline(
-      slope = 1,
-      intercept = 0,
-      linetype = "dashed",
-      color = "grey50"
-    ) +
-    labs(
-      title = paste0(
-        "ROC Curve: ",
-        h,
-        "-Month Recession Forecast"
-      ),
-      x = "False Positive Rate",
-      y = "True Positive Rate",
-      color = "Model"
-    ) +
-    theme_minimal()
+    output[[j]] <- data.frame(
+      sasdate=df$sasdate[i], horizon=horizon,
+      actual=df[[target]][i],
+      predicted_prob=predict_nb(fitted, df[i, , drop=FALSE])
+    )
+  }
+  bind_rows(output)
+}
+```
+
+```{r forecasts}
+datasets <- list(Macro=macro, Macro_Financial=macro_fin)
+horizons <- c(3L, 6L, 12L)
+all_forecasts <- list()
+for (dataset_name in names(datasets)) {
+  for (h in horizons) {
+    res <- forecast_nb(datasets[[dataset_name]], horizon=h, refit_every=1L)
+    res$dataset <- dataset_name
+    res$model <- "Naive Bayes"
+    all_forecasts[[paste(dataset_name, h, sep="_")]] <- res
+  }
+}
+nb_forecast_results <- bind_rows(all_forecasts)
+```
+
+```{r forecast-check}
+nb_forecast_results %>%
+  group_by(dataset, horizon) %>%
+  summarise(n_forecasts=n(), unique_dates=n_distinct(sasdate),
+            first_date=min(sasdate), last_date=max(sasdate),
+            min_prob=min(predicted_prob), max_prob=max(predicted_prob),
+            .groups="drop") %>%
+  kable(digits=3, caption="Out-of-sample forecast coverage")
+```
+
+## 5. Evaluation: AUC, F1, balanced accuracy and Brier score
+
+F1 and balanced accuracy use a fixed 0.50 classification threshold. Previously experimented with different threshold but performs relatively the same. AUC is threshold-independent; lower Brier score is better.
+
+```{r evaluate}
+evaluate_forecasts <- function(df, threshold=0.5) {
+  actual <- df$actual
+  prob <- df$predicted_prob
+  predicted <- as.integer(prob >= threshold)
+  TP <- sum(predicted==1 & actual==1)
+  TN <- sum(predicted==0 & actual==0)
+  FP <- sum(predicted==1 & actual==0)
+  FN <- sum(predicted==0 & actual==1)
+  precision <- if (TP+FP==0) 0 else TP/(TP+FP)
+  recall <- if (TP+FN==0) NA_real_ else TP/(TP+FN)
+  specificity <- if (TN+FP==0) NA_real_ else TN/(TN+FP)
+  f1 <- if (is.na(recall)) NA_real_ else if (precision+recall==0) 0 else
+    2*precision*recall/(precision+recall)
+  balanced_accuracy <- (recall+specificity)/2
+  brier <- mean((actual-prob)^2)
+  auc_value <- if (length(unique(actual))<2L) NA_real_ else
+    as.numeric(pROC::auc(pROC::roc(actual, prob, levels=c(0,1), direction="<", quiet=TRUE)))
+  data.frame(AUC=auc_value, F1=f1, Balanced_Accuracy=balanced_accuracy, Brier=brier)
+}
+nb_evaluation_results <- nb_forecast_results %>%
+  group_by(dataset, horizon, model) %>%
+  group_modify(~evaluate_forecasts(.x)) %>% ungroup()
+kable(nb_evaluation_results, digits=3, caption="Naive Bayes out-of-sample performance")
+```
+
+## 6. Incremental value of financial indicators
+
+Positive gains indicate better performance from adding financial indicators. For Brier score, improvement is the reduction in error.
+
+```{r financial-comparison}
+nb_financial_comparison <- nb_evaluation_results %>%
+  select(dataset,horizon,AUC,F1,Balanced_Accuracy,Brier) %>%
+  pivot_wider(names_from=dataset, values_from=c(AUC,F1,Balanced_Accuracy,Brier)) %>%
+  mutate(AUC_gain=AUC_Macro_Financial-AUC_Macro,
+         F1_gain=F1_Macro_Financial-F1_Macro,
+         Balanced_Accuracy_gain=Balanced_Accuracy_Macro_Financial-Balanced_Accuracy_Macro,
+         Brier_improvement=Brier_Macro-Brier_Macro_Financial) %>%
+  select(horizon,AUC_gain,F1_gain,Balanced_Accuracy_gain,Brier_improvement)
+kable(nb_financial_comparison, digits=3, caption="Incremental value of financial indicators")
+```
+
+## 7. Paired moving-block bootstrap for AUC gain
+
+Resample 24-month blocks of forecast origins, preserving matched Macro and Macro + Financial predictions. Percentile intervals are descriptive uncertainty estimates and depend on the chosen block length.
+
+```{r auc-bootstrap}
+block_bootstrap_auc_gain <- function(actual, prob_macro, prob_fin,
+                                     block_length=24L, n_boot=1000L) {
+  n <- length(actual)
+  if (n < block_length) stop("Block length exceeds test sample")
+  n_blocks <- ceiling(n/block_length)
+  auc_for <- function(y,p) as.numeric(pROC::auc(
+    pROC::roc(y,p,levels=c(0,1),direction="<",quiet=TRUE)))
+  gains <- replicate(n_boot, {
+    starts <- sample.int(n-block_length+1L, n_blocks, replace=TRUE)
+    idx <- unlist(lapply(starts, function(s) seq.int(s,s+block_length-1L)))[seq_len(n)]
+    y <- actual[idx]
+    if (length(unique(y))<2L) NA_real_ else
+      auc_for(y,prob_fin[idx])-auc_for(y,prob_macro[idx])
+  })
+  observed <- auc_for(actual,prob_fin)-auc_for(actual,prob_macro)
+  if (!any(is.finite(gains))) stop("No valid bootstrap samples")
+  data.frame(AUC_gain=observed,
+             CI_lower=unname(quantile(gains,.025,na.rm=TRUE)),
+             CI_upper=unname(quantile(gains,.975,na.rm=TRUE)),
+             valid_resamples=sum(is.finite(gains)))
 }
 
-# Generate and display ROC curves
-for (h in HORIZONS) {
-  print(create_roc_plot(h))
+# Check that both datasets have the same outcomes for each forecast date.
+actual_check <- nb_forecast_results %>%
+  group_by(sasdate,horizon) %>%
+  summarise(n_datasets=n_distinct(dataset), n_actual=n_distinct(actual), .groups="drop")
+stopifnot(all(actual_check$n_datasets==2L), all(actual_check$n_actual==1L))
+
+paired <- nb_forecast_results %>%
+  select(sasdate,horizon,dataset,actual,predicted_prob) %>%
+  pivot_wider(names_from=dataset, values_from=predicted_prob) %>%
+  arrange(horizon,sasdate)
+stopifnot(!anyNA(paired$Macro), !anyNA(paired$Macro_Financial))
+set.seed(1213)
+nb_auc_gain_ci <- paired %>%
+  group_by(horizon) %>%
+  group_modify(~block_bootstrap_auc_gain(.x$actual,.x$Macro,.x$Macro_Financial)) %>%
+  ungroup() %>%
+  mutate(significant=CI_lower>0 | CI_upper<0)
+kable(nb_auc_gain_ci,digits=3,caption="Paired block-bootstrap AUC gain (95% intervals)")
+```
+
+## 8. ROC curves
+
+```{r roc-curves, fig.width=8, fig.height=5}
+for (h in horizons) {
+  horizon_data <- nb_forecast_results %>% filter(horizon==h)
+  curves <- lapply(split(horizon_data,horizon_data$dataset), function(d) {
+    pROC::roc(d$actual,d$predicted_prob,levels=c(0,1),direction="<",quiet=TRUE)
+  })
+  print(pROC::ggroc(curves, legacy.axes=TRUE) +
+          geom_abline(slope=1,intercept=0,linetype="dashed",color="grey50") +
+          labs(title=paste0("Naive Bayes ROC: ",h,"-month horizon"),
+               x="False positive rate",y="True positive rate",color="Dataset") +
+          theme_minimal())
 }
 ```
