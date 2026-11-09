@@ -290,7 +290,8 @@ horizons <- c(3,6,12)
 post_options <- c(FALSE,TRUE)
 
 # store predictions
-all_forecasts <- list()
+run_lasso_models <- function(datasets) {
+  all_forecasts <- list()
 
 for (dataset_name in names(datasets)) {
   for (h in horizons) {
@@ -309,10 +310,10 @@ for (dataset_name in names(datasets)) {
     }
   }
 }
+  bind_rows(all_forecasts)
+}
 
-# combine results
-forecast_results <- bind_rows(all_forecasts)
-head(forecast_results)
+forecast_results <- run_lasso_models(datasets)
 
 ```
 ```{r}
@@ -487,5 +488,186 @@ lasso_auc_ci <- paired_forecasts %>%
   arrange(model, horizon)
 
 print(lasso_auc_ci, n=Inf)
+```
+## Extension: LASSO with Selected Lagged Predictors according to Economic Intuition
+
+1. Define lag specifications and add lag predictors
+
+```{r}
+lag_spec <- list(UNRATE = c(3,6),
+                 PAYEMS = c(3,6),
+                 CPIAUCSL = c(3,6),
+                 HOUST = c(3,6),
+                 S_P_500 = c(3,6),
+                 T10YFFM = c(6,12))
+
+data.frame(variable = names(lag_spec), available = names(lag_spec) %in% names(macro_fin_model))
+
+# adding lag predictors to dataset
+add_selected_lags <- function(df, lag_spec) {
+  df <- df %>% arrange(sasdate)
+  for(variable in names(lag_spec)) {
+    if (!variable %in% names(df)) {
+      next
+    }
+    for (k in lag_spec[[variable]]) {
+      new_col <- paste0(variable, "_lag", k)
+      df[[new_col]] <- lag(df[[variable]], k)
+    }
+  }
+  return(df)
+}
+
+macro_lagged <- add_selected_lags(macro_model, lag_spec)
+macro_fin_lagged <- add_selected_lags(macro_fin_model, lag_spec)
+```
+
+2. Handle missing observations due to lags
+
+```{r}
+lag_start <- min(macro_model$sasdate) %m+% months(12)
+macro_lagged <- macro_lagged %>%
+  filter(sasdate >= lag_start)
+macro_fin_lagged <- macro_fin_lagged %>%
+  filter(sasdate >= lag_start)
+
+# verify that there is no missing values
+excluded_cols <- c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+
+sum(is.na(macro_lagged[setdiff(names(macro_lagged), excluded_cols)]))
+sum(is.na(macro_fin_lagged[setdiff(names(macro_fin_lagged), excluded_cols)]))
+```
+3. Run all 12 lagged LASSO configurations
+
+```{r}
+datasets_lagged <- list(
+  Macro = macro_lagged,
+  Macro_Financial = macro_fin_lagged
+)
+
+forecast_results_lagged <- run_lasso_models(datasets_lagged)
+```
+
+```{r}
+evaluation_results_lagged <- forecast_results_lagged %>%
+  group_by(dataset, horizon, model) %>%
+  group_modify(~ evaluate_forecasts(.x)) %>%
+  ungroup()
+
+print(evaluation_results_lagged, n=Inf)
+```
+
+4. Macro and Macro-Financial Comparison
+
+#codes are in chunk since i did not make my previous functions reusable oops
+```{r}
+financial_comparison_lagged <- evaluation_results_lagged %>%
+  select(dataset, horizon, model, AUC, F1,
+         Balanced_Accuracy, Brier) %>%
+  pivot_wider(
+    names_from = dataset,
+    values_from = c(AUC, F1, Balanced_Accuracy, Brier)
+  ) %>%
+  mutate(
+    AUC_gain = AUC_Macro_Financial - AUC_Macro,
+    F1_gain = F1_Macro_Financial - F1_Macro,
+    Balanced_Accuracy_gain =
+      Balanced_Accuracy_Macro_Financial -
+      Balanced_Accuracy_Macro,
+    Brier_improvement = Brier_Macro - Brier_Macro_Financial
+  ) %>%
+  select(
+    horizon, model, AUC_gain, F1_gain,
+    Balanced_Accuracy_gain, Brier_improvement
+  )
+
+print(financial_comparison_lagged, n = Inf)
+```
+
+5. Statistical significance of AUC gains through block bootstrap
+
+```{r}
+
+# Pair Macro and Macro + Financial predictions
+paired_forecasts_lagged <- forecast_results_lagged %>%
+  select(sasdate, horizon, model, dataset,
+         actual, predicted_prob) %>%
+  pivot_wider(
+    names_from = dataset,
+    values_from = c(actual, predicted_prob)
+  ) %>%
+  arrange(horizon, model, sasdate)
+
+# Verify matching observations
+stopifnot(
+  !anyNA(paired_forecasts_lagged),
+  all(paired_forecasts_lagged$actual_Macro ==
+      paired_forecasts_lagged$actual_Macro_Financial)
+)
+
+# Paired moving-block bootstrap
+set.seed(1213)
+
+lasso_auc_ci_lagged <- paired_forecasts_lagged %>%
+  group_by(horizon, model) %>%
+  group_modify(~ block_bootstrap_auc_gain(
+    actual = .x$actual_Macro,
+    prob_macro = .x$predicted_prob_Macro,
+    prob_fin = .x$predicted_prob_Macro_Financial,
+    block_length = 24,
+    n_boot = 1000
+  )) %>%
+  ungroup() %>%
+  mutate(
+    significant = CI_lower > 0 | CI_upper < 0
+  ) %>%
+  arrange(model, horizon)
+
+print(lasso_auc_ci_lagged, n = Inf)
+
+```
+6. Comparison change in model performance of lagged predictors addition to the model
+
+```{r}
+
+# Match original and lagged forecasts by date and model
+paired_lag <- forecast_results %>%
+  select(sasdate, horizon, model, dataset,
+         actual, prob_original = predicted_prob) %>%
+  inner_join(
+    forecast_results_lagged %>%
+      select(sasdate, horizon, model, dataset,
+             actual, prob_lagged = predicted_prob),
+    by = c("sasdate", "horizon", "model", "dataset", "actual")
+  )
+
+# Compare performance on identical forecast dates
+lag_performance <- paired_lag %>%
+  group_by(dataset, horizon, model) %>%
+  group_modify(~ {
+
+    original <- evaluate_forecasts(data.frame(
+      actual = .x$actual,
+      predicted_prob = .x$prob_original
+    ))
+
+    lagged <- evaluate_forecasts(data.frame(
+      actual = .x$actual,
+      predicted_prob = .x$prob_lagged
+    ))
+
+    data.frame(
+      AUC_original = original$AUC,
+      AUC_lagged = lagged$AUC,
+      AUC_change = lagged$AUC - original$AUC,
+      Brier_original = original$Brier,
+      Brier_lagged = lagged$Brier,
+      Brier_improvement = original$Brier - lagged$Brier
+    )
+  }) %>%
+  ungroup()
+
+print(lag_performance, n = Inf)
+
 ```
 
