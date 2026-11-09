@@ -535,3 +535,167 @@ best_mtry <- tuning_results %>%
   ungroup()
 best_mtry
 ```
+
+## 8. Extension: RF and Bagging with Selected Lagged Predictors
+
+Same lag specification across models, so the extension is comparable. Lags are added after the targets are built, and the first 12 months are dropped so that every lag is observed. 
+
+### 8.1 Add lagged predictors
+
+```{r rf-add-lags}
+lag_spec <- list(UNRATE   = c(3, 6),
+                 PAYEMS   = c(3, 6),
+                 CPIAUCSL = c(3, 6),
+                 HOUST    = c(3, 6),
+                 S_P_500  = c(3, 6),
+                 T10YFFM  = c(6, 12))
+
+# add lagged columns for the variables in each dataset
+add_selected_lags <- function(df, lag_spec) {
+  df <- df %>% arrange(sasdate)
+  for (variable in names(lag_spec)) {
+    if (!variable %in% names(df)) next
+    for (k in lag_spec[[variable]]) {
+      df[[paste0(variable, "_lag", k)]] <- lag(df[[variable]], k)
+    }
+  }
+  df
+}
+
+macro_lagged     <- add_selected_lags(macro, lag_spec)
+macro_fin_lagged <- add_selected_lags(macro_fin, lag_spec)
+
+# drop the first 12 months, where longest lag is not yet observed
+lag_start <- seq(min(macro$sasdate), by = "1 month", length.out = 13)[13]
+macro_lagged     <- macro_lagged %>% filter(sasdate >= lag_start)
+macro_fin_lagged <- macro_fin_lagged %>% filter(sasdate >= lag_start)
+
+# checks: no missing predictors, and the number of predictors (p) in each set
+excluded_cols <- c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+stopifnot(sum(is.na(macro_lagged[setdiff(names(macro_lagged), excluded_cols)])) == 0,
+          sum(is.na(macro_fin_lagged[setdiff(names(macro_fin_lagged), excluded_cols)])) == 0)
+
+c(p_macro_lagged     = length(setdiff(names(macro_lagged), excluded_cols)),
+  p_macro_fin_lagged = length(setdiff(names(macro_fin_lagged), excluded_cols)))
+```
+
+### 8.2 Run all 12 lagged configurations
+
+This uses the same function and settings as Section 4.
+
+```{r rf-forecasts-lagged}
+datasets_lagged <- list(Macro = macro_lagged, Macro_Financial = macro_fin_lagged)
+
+rf_file_lagged <- "../data/results/rf_forecasts_lagged.rds"
+
+# load saved forecasts if exists, if not run every combination (delete the file to force a re-run)
+if (file.exists(rf_file_lagged)) {
+  rf_forecast_results_lagged <- readRDS(rf_file_lagged)
+} else {
+  all_forecasts_lagged <- list()
+
+  for (dataset_name in names(datasets_lagged)) {
+    for (h in horizons) {
+      for (model_type in model_types) {
+        cat("Running (lagged):", dataset_name, h, model_type, "\n")
+        result <- forecast_rf(
+          df = datasets_lagged[[dataset_name]],
+          horizon = h,
+          model_type = model_type
+        )
+        result$dataset <- dataset_name
+        result$model <- model_type
+        all_forecasts_lagged[[paste(dataset_name, h, model_type, sep = "_")]] <- result
+      }
+    }
+  }
+
+  rf_forecast_results_lagged <- bind_rows(all_forecasts_lagged)
+  dir.create(dirname(rf_file_lagged), showWarnings = FALSE)
+  saveRDS(rf_forecast_results_lagged, rf_file_lagged)
+}
+
+# verify that all 12 configurations ran, with the same test months as before
+rf_forecast_results_lagged %>%
+  group_by(dataset, horizon, model) %>%
+  summarise(n_forecasts = n(), unique_dates = n_distinct(sasdate), .groups = "drop")
+```
+
+### 8.3 Evaluation and Macro vs Macro + Financial
+
+```{r rf-evaluate-lagged}
+rf_evaluation_results_lagged <- rf_forecast_results_lagged %>%
+  group_by(dataset, horizon, model) %>%
+  group_modify(~ evaluate_forecasts(.x)) %>%
+  ungroup()
+
+print(rf_evaluation_results_lagged, n = Inf)
+
+rf_financial_comparison_lagged <- rf_evaluation_results_lagged %>%
+  pivot_wider(names_from = dataset,
+              values_from = c(AUC, F1, Balanced_Accuracy, Brier)) %>%
+  mutate(
+    AUC_gain = AUC_Macro_Financial - AUC_Macro,
+    F1_gain = F1_Macro_Financial - F1_Macro,
+    Balanced_Accuracy_gain = Balanced_Accuracy_Macro_Financial - Balanced_Accuracy_Macro,
+    Brier_improvement = Brier_Macro - Brier_Macro_Financial
+  ) %>%
+  select(horizon, model, AUC_gain, F1_gain, Balanced_Accuracy_gain, Brier_improvement) %>%
+  arrange(model, horizon)
+
+print(rf_financial_comparison_lagged, n = Inf)
+```
+
+### 8.4 Check if AUC gain is real (block bootstrap)
+
+Same bootstrap as Section 5.3, applied to the lagged forecasts.
+
+```{r rf-auc-bootstrap-lagged, cache=TRUE}
+set.seed(1213)
+auc_gain_ci_lagged <- rf_forecast_results_lagged %>%
+  select(sasdate, horizon, model, dataset, actual, predicted_prob) %>%
+  pivot_wider(names_from = dataset, values_from = predicted_prob) %>%
+  arrange(sasdate) %>%
+  group_by(horizon, model) %>%
+  group_modify(~ block_bootstrap_auc_gain(.x$actual, .x$Macro, .x$Macro_Financial)) %>%
+  ungroup() %>%
+  mutate(significant = CI_lower > 0 | CI_upper < 0) %>%
+  arrange(model, horizon)
+
+print(auc_gain_ci_lagged, n = Inf)
+```
+
+### 8.5 Check if adding lags improve performance
+
+Compare the original and lagged forecasts on the same test months.
+
+```{r rf-lag-comparison}
+paired_lag <- rf_forecast_results %>%
+  select(sasdate, horizon, model, dataset, actual, prob_original = predicted_prob) %>%
+  inner_join(
+    rf_forecast_results_lagged %>%
+      select(sasdate, horizon, model, dataset, actual, prob_lagged = predicted_prob),
+    by = c("sasdate", "horizon", "model", "dataset", "actual")
+  )
+
+rf_lag_performance <- paired_lag %>%
+  group_by(dataset, horizon, model) %>%
+  group_modify(~ {
+    original <- evaluate_forecasts(data.frame(actual = .x$actual, predicted_prob = .x$prob_original))
+    lagged   <- evaluate_forecasts(data.frame(actual = .x$actual, predicted_prob = .x$prob_lagged))
+    data.frame(
+      n_paired = nrow(.x),
+      AUC_original = original$AUC,
+      AUC_lagged = lagged$AUC,
+      AUC_change = lagged$AUC - original$AUC,
+      Brier_original = original$Brier,
+      Brier_lagged = lagged$Brier,
+      Brier_improvement = original$Brier - lagged$Brier
+    )
+  }) %>%
+  ungroup() %>%
+  arrange(model, dataset, horizon)
+
+print(rf_lag_performance, n = Inf)
+```
+
