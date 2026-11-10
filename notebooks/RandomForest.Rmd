@@ -699,3 +699,21 @@ rf_lag_performance <- paired_lag %>%
 print(rf_lag_performance, n = Inf)
 ```
 
+### 8.6 Check if gain from adding lags is real (block bootstrap)
+
+Same bootstrap as Section 5.3, comparing lagged against original forecasts on the same test months. `AUC_gain` here is AUC(lagged) − AUC(original).
+
+```{r rf-lag-bootstrap, cache=TRUE}
+set.seed(1213)
+lag_gain_ci <- paired_lag %>%
+  arrange(sasdate) %>%
+  group_by(dataset, horizon, model) %>%
+  group_modify(~ block_bootstrap_auc_gain(.x$actual, .x$prob_original, .x$prob_lagged)) %>%
+  ungroup() %>%
+  rename(AUC_change = AUC_gain) %>%
+  mutate(significant = CI_lower > 0 | CI_upper < 0) %>%
+  arrange(model, dataset, horizon)
+
+print(lag_gain_ci, n = Inf)
+```
+
