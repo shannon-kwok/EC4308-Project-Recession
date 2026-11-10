@@ -215,7 +215,7 @@ forecast_results %>% group_by(dataset, horizon, model) %>%
 
 # 7. Out-of-sample evaluation
 
-AUC evaluates ranking performance; F1 evaluates binary classification at the pre-specified threshold of 0.5; balanced accuracy and Brier score provide complementary diagnostics. If either class is absent or no valid forecasts exist, the affected metric is `NA`. **Do not compare configurations with different valid test dates.**
+AUC evaluates ranking performance; F1 evaluates binary classification at the pre-specified threshold of 0.5; balanced accuracy and Brier score provide complementary diagnostics. If either class is absent or no valid forecasts exist, the affected metric is `NA`.
 
 ```{r evaluation-functions}
 
@@ -299,13 +299,247 @@ paired_metrics <- paired_forecasts %>%
 kable(paired_metrics, digits = 4)
 ```
 
-# 9. Save forecasts for cross-model comparisons
+# 9. Statistical significance of AUC gains: block bootstrap
 
-```{r save-results}
-dir.create("../results", recursive = TRUE, showWarnings = FALSE)
-write_csv(forecast_results, "../results/static_probit_logit_forecasts.csv")
-write_csv(evaluation_results, "../results/static_probit_logit_evaluation.csv")
-write_csv(paired_metrics, "../results/static_probit_logit_financial_comparison.csv")
+The AUC gain from adding financial indicators is a single number from a test sample with only four recession episodes, so we test whether it is distinguishable from zero. We use the same paired moving-block bootstrap as the LASSO and Random Forest notebooks (24-month blocks, 1,000 resamples, seed 1213), so the results are comparable across all four models.
+
+
+
+```{r auc-bootstrap}
+block_bootstrap_auc_gain <- function(actual, prob_macro, prob_fin,
+                                     block_length = 24, n_boot = 1000) {
+  n <- length(actual)
+  n_blocks <- ceiling(n / block_length)
+
+  calculate_auc <- function(y, p) {
+    if (length(unique(y)) < 2) return(NA_real_)
+    as.numeric(pROC::auc(pROC::roc(y, p, levels = c(0, 1),
+                                   direction = "<", quiet = TRUE)))
+  }
+
+  # observed improvement in AUC
+  observed_gain <- calculate_auc(actual, prob_fin) - calculate_auc(actual, prob_macro)
+
+  # bootstrap resampling of 24-month blocks (same months for both specifications)
+  gains <- replicate(n_boot, {
+    starts <- sample(seq_len(n - block_length + 1), n_blocks, replace = TRUE)
+    idx <- unlist(lapply(starts, function(s) s:(s + block_length - 1)))[seq_len(n)]
+    calculate_auc(actual[idx], prob_fin[idx]) -
+      calculate_auc(actual[idx], prob_macro[idx])
+  })
+  gains <- gains[is.finite(gains)]
+  if (length(gains) < 100) stop("Too few valid bootstrap samples.")
+
+  data.frame(n = n,
+             AUC_gain = observed_gain,
+             CI_lower = unname(quantile(gains, 0.025)),
+             CI_upper = unname(quantile(gains, 0.975)),
+             valid_resamples = length(gains))
+}
+
+# paired_forecasts (Section 8) already keeps only dates where both specifications have valid forecasts
+set.seed(1213)
+auc_gain_ci <- paired_forecasts %>%
+  arrange(horizon, model, sasdate) %>%
+  group_by(horizon, model) %>%
+  group_modify(~ block_bootstrap_auc_gain(
+    actual = .x$actual,
+    prob_macro = .x$predicted_prob_Macro,
+    prob_fin = .x$predicted_prob_Macro_Financial
+  )) %>%
+  ungroup() %>%
+  mutate(significant = CI_lower > 0 | CI_upper < 0) %>%
+  arrange(model, horizon)
+
+kable(auc_gain_ci, digits = 4)
+```
+
+# Extension: Probit/Logit with Selected Lagged Predictors according to Economic Intuition
+
+This extension mirrors the LASSO extension. It asks whether adding a few lagged predictors, chosen in advance on economic grounds, improves the static models. Lags of predictors are known at the forecast origin, so this does not conflict with the exclusion of lagged recession indicators. The lag specification is identical to the LASSO extension so the two are comparable. The lags were fixed before looking at any test results. Note that the unpenalised models now have more predictors, so more early-window fits may fail. Check the failed-forecast table below.
+
+1. Define lag specifications and add lag predictors
+
+```{r lag-spec}
+lag_spec <- list(UNRATE = c(3, 6),
+                 PAYEMS = c(3, 6),
+                 CPIAUCSL = c(3, 6),
+                 HOUST = c(3, 6),
+                 S_P_500 = c(3, 6),
+                 T10YFFM = c(6, 12))
+
+# which lagged variables exist in each dataset
+data.frame(variable = names(lag_spec),
+           in_macro = names(lag_spec) %in% names(macro),
+           in_macro_fin = names(lag_spec) %in% names(macro_fin))
+
+# adding lag predictors to dataset
+add_selected_lags <- function(df, lag_spec) {
+  df <- df %>% arrange(sasdate)
+  for (variable in names(lag_spec)) {
+    if (!variable %in% names(df)) {
+      next
+    }
+    for (k in lag_spec[[variable]]) {
+      new_col <- paste0(variable, "_lag", k)
+      df[[new_col]] <- dplyr::lag(df[[variable]], k)
+    }
+  }
+  df
+}
+
+# targets were already built on the full sample (Section 3), before any rows are dropped
+macro_lagged <- add_selected_lags(macro, lag_spec)
+macro_fin_lagged <- add_selected_lags(macro_fin, lag_spec)
+```
+
+2. Handle missing observations due to lags
+
+```{r lag-missing}
+# the first 12 months have missing lags (longest lag is 12), so drop them
+lag_start <- seq(min(macro$sasdate), by = "12 months", length.out = 2)[2]
+
+macro_lagged <- macro_lagged %>% filter(sasdate >= lag_start)
+macro_fin_lagged <- macro_fin_lagged %>% filter(sasdate >= lag_start)
+
+# remaining missing predictor cells (rows with any missing predictor are dropped by the forecasting function, not imputed)
+lag_excluded <- c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+sum(is.na(macro_lagged[setdiff(names(macro_lagged), lag_excluded)]))
+sum(is.na(macro_fin_lagged[setdiff(names(macro_fin_lagged), lag_excluded)]))
+
+# number of predictors with lags
+c(Macro = length(get_predictors(macro_lagged)),
+  Macro_Financial = length(get_predictors(macro_fin_lagged)))
+```
+
+3. Run all 12 lagged Probit/Logit configurations
+
+```{r run-lagged-forecasts, cache=TRUE}
+# same loop as Section 6, wrapped in a function so it can be reused on the lagged datasets
+run_binary_models <- function(datasets) {
+  all_forecasts <- list()
+  for (dataset_name in names(datasets)) {
+    for (h in horizons) {
+      for (model_name in c("Logit", "Probit")) {
+        cat("Running:", dataset_name, h, model_name, "\n")
+        result <- forecast_binary(datasets[[dataset_name]], h, model_name,
+                                  test_start, announcement_delay_months)
+        result$dataset <- dataset_name
+        all_forecasts[[paste(dataset_name, h, model_name, sep = "_")]] <- result
+      }
+    }
+  }
+  bind_rows(all_forecasts)
+}
+
+datasets_lagged <- list(Macro = macro_lagged, Macro_Financial = macro_fin_lagged)
+forecast_results_lagged <- run_binary_models(datasets_lagged)
+
+forecast_results_lagged %>% group_by(dataset, horizon, model) %>%
+  summarise(test_rows = n(), valid_forecasts = sum(is.finite(predicted_prob)),
+            failed_forecasts = sum(!is.finite(predicted_prob)), .groups = "drop") %>% kable()
+```
+
+4. Macro and Macro-Financial comparison
+
+```{r lagged-evaluation}
+evaluation_results_lagged <- forecast_results_lagged %>%
+  group_by(dataset, horizon, model) %>%
+  group_modify(~ evaluate_forecasts(.x)) %>%
+  ungroup()
+kable(evaluation_results_lagged, digits = 4)
+
+# same paired logic as Section 8, wrapped in functions so they can be reused
+pair_forecasts <- function(fc) {
+  fc %>%
+    select(sasdate, horizon, model, dataset, actual, predicted_prob) %>%
+    pivot_wider(names_from = dataset,
+                values_from = c(actual, predicted_prob)) %>%
+    filter(is.finite(predicted_prob_Macro),
+           is.finite(predicted_prob_Macro_Financial)) %>%
+    mutate(actual = actual_Macro) %>%
+    filter(actual_Macro == actual_Macro_Financial) %>%
+    arrange(horizon, model, sasdate)
+}
+
+gain_table <- function(paired) {
+  paired %>%
+    group_by(horizon, model) %>%
+    group_modify(~ {
+      macro_eval <- evaluate_forecasts(data.frame(actual = .x$actual,
+                                                  predicted_prob = .x$predicted_prob_Macro))
+      fin_eval <- evaluate_forecasts(data.frame(actual = .x$actual,
+                                                predicted_prob = .x$predicted_prob_Macro_Financial))
+      data.frame(n_paired = nrow(.x),
+                 AUC_gain = fin_eval$AUC - macro_eval$AUC,
+                 F1_gain = fin_eval$F1 - macro_eval$F1,
+                 Balanced_Accuracy_gain = fin_eval$Balanced_Accuracy - macro_eval$Balanced_Accuracy,
+                 Brier_improvement = macro_eval$Brier - fin_eval$Brier)
+    }) %>% ungroup()
+}
+
+paired_forecasts_lagged <- pair_forecasts(forecast_results_lagged)
+financial_comparison_lagged <- gain_table(paired_forecasts_lagged)
+kable(financial_comparison_lagged, digits = 4)
+```
+
+5. Statistical significance of AUC gains through block bootstrap
+
+```{r lagged-bootstrap}
+# paired moving-block bootstrap (function defined in Section 9)
+set.seed(1213)
+auc_gain_ci_lagged <- paired_forecasts_lagged %>%
+  group_by(horizon, model) %>%
+  group_modify(~ block_bootstrap_auc_gain(
+    actual = .x$actual,
+    prob_macro = .x$predicted_prob_Macro,
+    prob_fin = .x$predicted_prob_Macro_Financial,
+    block_length = 24,
+    n_boot = 1000
+  )) %>%
+  ungroup() %>%
+  mutate(significant = CI_lower > 0 | CI_upper < 0) %>%
+  arrange(model, horizon)
+
+kable(auc_gain_ci_lagged, digits = 4)
+```
+
+6. Comparison of model performance with and without the lagged predictors
+
+```{r lag-comparison}
+# match original and lagged forecasts by date, model and dataset; keep dates where both are valid
+paired_lag <- forecast_results %>%
+  select(sasdate, horizon, model, dataset,
+         actual, prob_original = predicted_prob) %>%
+  inner_join(
+    forecast_results_lagged %>%
+      select(sasdate, horizon, model, dataset,
+             actual, prob_lagged = predicted_prob),
+    by = c("sasdate", "horizon", "model", "dataset", "actual")
+  ) %>%
+  filter(is.finite(prob_original), is.finite(prob_lagged))
+
+# compare performance on identical forecast dates
+lag_performance <- paired_lag %>%
+  group_by(dataset, horizon, model) %>%
+  group_modify(~ {
+    original <- evaluate_forecasts(data.frame(actual = .x$actual,
+                                              predicted_prob = .x$prob_original))
+    lagged <- evaluate_forecasts(data.frame(actual = .x$actual,
+                                            predicted_prob = .x$prob_lagged))
+    data.frame(
+      n_paired = nrow(.x),
+      AUC_original = original$AUC,
+      AUC_lagged = lagged$AUC,
+      AUC_change = lagged$AUC - original$AUC,
+      Brier_original = original$Brier,
+      Brier_lagged = lagged$Brier,
+      Brier_improvement = original$Brier - lagged$Brier
+    )
+  }) %>%
+  ungroup()
+
+kable(lag_performance, digits = 4)
 ```
 
 
