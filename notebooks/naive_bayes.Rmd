@@ -31,26 +31,26 @@ macro <- read_csv("../data/processed/fred_md_macro_clean_final.csv", show_col_ty
   mutate(sasdate=as.Date(sasdate)) %>% arrange(sasdate) #Format Date
 macro_fin <- read_csv("../data/processed/fred_md_macro_financial_clean_final.csv", show_col_types=FALSE) %>%
   mutate(sasdate=as.Date(sasdate)) %>% arrange(sasdate) #Format Date
-#Check Monthly Continuity
-month_index <- function(x) as.integer(format(x, "%Y"))*12L + as.integer(format(x, "%m"))
+
+#Checking Month Continuity
+month_index <- function(x) as.integer(format(x,"%Y"))*12L + as.integer(format(x,"%m"))
 stopifnot(all(diff(month_index(macro$sasdate)) == 1L))
 ```
 
-## 2. Target: any recession within the next h months
+## 2. Target Construction: any recession within the next h months
 
-`Y_h` is 1 if any month from t+1 through t+h has USREC=1, and 0 otherwise. The last h observations have unknown targets and are excluded from evaluation.
+`Y_h` is 1 if at least one of the months t+1 through t+h is recessionary.
 
 ```{r targets}
 create_targets <- function(df) {
   df <- arrange(df, sasdate)
-  for (h in c(3L, 6L, 12L)) {
-    y <- vapply(seq_len(nrow(df)), function(i) {
-      if (i + h > nrow(df)) return(NA_integer_)
+  for (h in c(3L,6L,12L)) {
+    df[[paste0("Y_",h)]] <- vapply(seq_len(nrow(df)), function(i) {
+      if (i+h > nrow(df)) return(NA_integer_)
       future <- df$USREC[(i+1L):(i+h)]
       if (anyNA(future)) return(NA_integer_)
       as.integer(any(future == 1L))
     }, integer(1))
-    df[[paste0("Y_", h)]] <- y
   }
   df
 }
@@ -58,201 +58,349 @@ macro <- create_targets(macro)
 macro_fin <- create_targets(macro_fin)
 ```
 
-## 3. Gaussian Naive Bayes functions
+## 3. Forward-fill for missing values
 
-Predictor filtering and median imputation are fitted only on the eligible training sample at each forecast origin.
-
-```{r nb-functions}
-fit_nb <- function(train, predictors, epsilon=1e-6) {
-  x <- train[, predictors, drop=FALSE]
-  if (!all(vapply(x, is.numeric, logical(1)))) stop("Predictors must be numeric")
-  valid <- predictors[vapply(x, function(z) {
-    z <- z[is.finite(z)]
-    length(z) >= 2L && length(unique(z)) > 1L
-  }, logical(1))]
-  if (!length(valid)) stop("No usable predictors")
-  x <- x[, valid, drop=FALSE]
-  medians <- vapply(x, function(z) median(z[is.finite(z)]), numeric(1))
-  for (v in valid) x[[v]][!is.finite(x[[v]])] <- medians[[v]]
-  y <- factor(train$target, levels=c(0,1))
-  if (anyNA(y) || length(unique(y)) < 2L) stop("Both target classes required")
-  x$target <- y
-  fit <- e1071::naiveBayes(target ~ ., data=x, eps=epsilon, threshold=epsilon)
-  list(fit=fit, predictors=valid, medians=medians)
+```{r forward-fill}
+predictor_cols <- setdiff(
+  names(macro),
+  c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+)
+# forward fill function
+forward_fill <- function(df) {
+  predictor_cols <- setdiff(
+    names(df),
+    c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+  )
+  df %>%
+    arrange(sasdate) %>%
+    fill(all_of(predictor_cols), .direction = "down")
 }
 
-predict_nb <- function(fitted, newdata) {
-  x <- newdata[, fitted$predictors, drop=FALSE]
-  for (v in fitted$predictors) x[[v]][!is.finite(x[[v]])] <- fitted$medians[[v]]
-  as.numeric(predict(fitted$fit, newdata=x, type="raw")[, "1"])
-}
+macro_model <- forward_fill(macro)
+macro_fin_model <- forward_fill(macro_fin)
+
+# check if missing values still exist
+sum(is.na(macro_model[predictor_cols]))
+predictor_cols_fin <- setdiff(
+  names(macro_fin_model),
+  c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
+)
+sum(is.na(macro_fin_model[predictor_cols_fin]))
 ```
 
-## 4. Monthly expanding-window forecasts
+## 4. Gaussian Naive Bayes functions
 
-For forecast row i and horizon h, training rows end at i-h-1. It assumes completed historical recession labels are available without additional announcement delays. Models are refitted every month.
+```{r nb-functions}
+
+fit_nb <- function(train, predictors, epsilon = 1e-6) {
+  x <- train[, predictors, drop = FALSE]
+  # Remove predictors with no variation
+  valid <- predictors[vapply(x, function(z) {length(unique(z)) > 1L}, logical(1))]
+  x <- x[, valid, drop = FALSE]
+  # Prepare target
+  x$target <- factor(train$target, levels = c(0, 1))
+  # Fit Gaussian Naive Bayes
+  fit <- e1071::naiveBayes(target ~ .,data = x,eps = epsilon,threshold = epsilon)
+  list(fit = fit,predictors = valid)
+}
+predict_nb <- function(fitted, newdata) {
+  x <- newdata[, fitted$predictors, drop = FALSE]
+  as.numeric(predict(fitted$fit,newdata = x,type = "raw")[, "1"])
+}
+
+```
+
+## 5. Monthly expanding-window forecasts
 
 ```{r forecast-function}
-forecast_nb <- function(df, horizon, refit_every=1L,
-                        test_start=as.Date("1986-01-01")) {
-  stopifnot(refit_every >= 1L, horizon %in% c(3L,6L,12L))
+
+forecast_nb <- function(df, horizon, refit_every = 1L,
+                        test_start = as.Date("1986-01-01")) {
   df <- arrange(df, sasdate)
   target <- paste0("Y_", horizon)
-  predictors <- setdiff(names(df), c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample"))
+predictors <- setdiff(names(df),c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample"))  
+# Identify out-of-sample observations
   test_indices <- which(df$sasdate >= test_start & !is.na(df[[target]]))
-  if (!length(test_indices)) stop("No eligible test observations")
   output <- vector("list", length(test_indices))
   fitted <- NULL
+  # Monthly expanding-window forecasting
   for (j in seq_along(test_indices)) {
     i <- test_indices[j]
-    if ((j-1L) %% refit_every == 0L) {
+    # Refit model at specified frequency
+    if ((j - 1L) %% refit_every == 0L) {
       last_train <- i - horizon - 1L
-      if (last_train < 1L) stop("Insufficient training history")
-      train <- df[seq_len(last_train), , drop=FALSE] %>%
+      # Select eligible historical training observations
+      train <- df[seq_len(last_train), , drop = FALSE] %>%
         filter(!is.na(.data[[target]])) %>%
-        mutate(target=.data[[target]])
+        mutate(target = .data[[target]])
+      # Fit Gaussian Naive Bayes
       fitted <- fit_nb(train, predictors)
     }
+    # Generate out-of-sample recession probability
     output[[j]] <- data.frame(
-      sasdate=df$sasdate[i], horizon=horizon,
-      actual=df[[target]][i],
-      predicted_prob=predict_nb(fitted, df[i, , drop=FALSE])
+      sasdate = df$sasdate[i],
+      horizon = horizon,
+      actual = df[[target]][i],
+      predicted_prob = predict_nb(
+        fitted,
+        df[i, , drop = FALSE]
+      )
     )
   }
   bind_rows(output)
 }
+run_nb_models <- function(datasets,horizons=c(3L,6L,12L)) {
+  all_forecasts <- list()
+  for (dataset_name in names(datasets)) {
+    for (h in horizons) {
+      res <- forecast_nb(datasets[[dataset_name]],horizon=h,refit_every=1L)
+      res$dataset <- dataset_name
+      res$model <- "Naive Bayes"
+      all_forecasts[[paste(dataset_name,h,sep="_")]] <- res
+    }
+  }
+  bind_rows(all_forecasts)
+}
 ```
 
 ```{r forecasts}
-datasets <- list(Macro=macro, Macro_Financial=macro_fin)
-horizons <- c(3L, 6L, 12L)
-all_forecasts <- list()
-for (dataset_name in names(datasets)) {
-  for (h in horizons) {
-    res <- forecast_nb(datasets[[dataset_name]], horizon=h, refit_every=1L)
-    res$dataset <- dataset_name
-    res$model <- "Naive Bayes"
-    all_forecasts[[paste(dataset_name, h, sep="_")]] <- res
-  }
-}
-nb_forecast_results <- bind_rows(all_forecasts)
+#Running the models
+datasets <- list(Macro=macro_model,Macro_Financial=macro_fin_model)
+horizons <- c(3L,6L,12L)
+nb_forecast_results <- run_nb_models(datasets,horizons)
 ```
 
 ```{r forecast-check}
-nb_forecast_results %>%
-  group_by(dataset, horizon) %>%
-  summarise(n_forecasts=n(), unique_dates=n_distinct(sasdate),
-            first_date=min(sasdate), last_date=max(sasdate),
-            min_prob=min(predicted_prob), max_prob=max(predicted_prob),
-            .groups="drop") %>%
-  kable(digits=3, caption="Out-of-sample forecast coverage")
+#Out of sample forecast coverage (Ensures no duplicates etc)
+nb_forecast_results %>% group_by(dataset,horizon) %>%
+  summarise(n_forecasts=n(),unique_dates=n_distinct(sasdate),
+            first_date=min(sasdate),last_date=max(sasdate),
+            min_prob=min(predicted_prob),max_prob=max(predicted_prob),.groups="drop") %>%
+  kable(digits=3,caption="Out-of-sample forecast coverage")
 ```
 
-## 5. Evaluation: AUC, F1, balanced accuracy and Brier score
+## 6. Evaluation
 
-F1 and balanced accuracy use a fixed 0.50 classification threshold. Previously experimented with different threshold but performs relatively the same. AUC is threshold-independent; lower Brier score is better.
+AUC uses a fixed ROC direction; F1 and balanced accuracy use a classification threshold of 0.50.
 
 ```{r evaluate}
-evaluate_forecasts <- function(df, threshold=0.5) {
-  actual <- df$actual
-  prob <- df$predicted_prob
-  predicted <- as.integer(prob >= threshold)
-  TP <- sum(predicted==1 & actual==1)
-  TN <- sum(predicted==0 & actual==0)
-  FP <- sum(predicted==1 & actual==0)
-  FN <- sum(predicted==0 & actual==1)
+calculate_auc <- function(y,p) {
+  if (length(unique(y))<2L) return(NA_real_)
+  as.numeric(pROC::auc(pROC::roc(y,p,levels=c(0,1),direction="<",quiet=TRUE)))
+}
+
+evaluate_forecasts <- function(df,threshold=0.5) {
+  actual <- df$actual; prob <- df$predicted_prob
+  predicted <- as.integer(prob>=threshold)
+  TP <- sum(predicted==1 & actual==1); TN <- sum(predicted==0 & actual==0)
+  FP <- sum(predicted==1 & actual==0); FN <- sum(predicted==0 & actual==1)
   precision <- if (TP+FP==0) 0 else TP/(TP+FP)
   recall <- if (TP+FN==0) NA_real_ else TP/(TP+FN)
   specificity <- if (TN+FP==0) NA_real_ else TN/(TN+FP)
   f1 <- if (is.na(recall)) NA_real_ else if (precision+recall==0) 0 else
     2*precision*recall/(precision+recall)
-  balanced_accuracy <- (recall+specificity)/2
-  brier <- mean((actual-prob)^2)
-  auc_value <- if (length(unique(actual))<2L) NA_real_ else
-    as.numeric(pROC::auc(pROC::roc(actual, prob, levels=c(0,1), direction="<", quiet=TRUE)))
-  data.frame(AUC=auc_value, F1=f1, Balanced_Accuracy=balanced_accuracy, Brier=brier)
+  data.frame(AUC=calculate_auc(actual,prob),F1=f1,
+             Balanced_Accuracy=(recall+specificity)/2,
+             Brier=mean((actual-prob)^2))
 }
+#Results
 nb_evaluation_results <- nb_forecast_results %>%
-  group_by(dataset, horizon, model) %>%
-  group_modify(~evaluate_forecasts(.x)) %>% ungroup()
-kable(nb_evaluation_results, digits=3, caption="Naive Bayes out-of-sample performance")
+  group_by(dataset,horizon,model) %>% group_modify(~evaluate_forecasts(.x)) %>% ungroup()
+kable(nb_evaluation_results,digits=3,caption="Baseline Naive Bayes performance")
 ```
 
-## 6. Incremental value of financial indicators
-
-Positive gains indicate better performance from adding financial indicators. For Brier score, improvement is the reduction in error.
+## 7. Incremental value of financial indicators
 
 ```{r financial-comparison}
-nb_financial_comparison <- nb_evaluation_results %>%
-  select(dataset,horizon,AUC,F1,Balanced_Accuracy,Brier) %>%
-  pivot_wider(names_from=dataset, values_from=c(AUC,F1,Balanced_Accuracy,Brier)) %>%
-  mutate(AUC_gain=AUC_Macro_Financial-AUC_Macro,
-         F1_gain=F1_Macro_Financial-F1_Macro,
-         Balanced_Accuracy_gain=Balanced_Accuracy_Macro_Financial-Balanced_Accuracy_Macro,
-         Brier_improvement=Brier_Macro-Brier_Macro_Financial) %>%
-  select(horizon,AUC_gain,F1_gain,Balanced_Accuracy_gain,Brier_improvement)
-kable(nb_financial_comparison, digits=3, caption="Incremental value of financial indicators")
+compare_financial <- function(evaluations) {
+  evaluations %>%
+    select(dataset,horizon,model,AUC,F1,Balanced_Accuracy,Brier) %>%
+    pivot_wider(names_from=dataset,values_from=c(AUC,F1,Balanced_Accuracy,Brier)) %>%
+    mutate(AUC_gain=AUC_Macro_Financial-AUC_Macro,
+           F1_gain=F1_Macro_Financial-F1_Macro,
+           Balanced_Accuracy_gain=Balanced_Accuracy_Macro_Financial-Balanced_Accuracy_Macro,
+           Brier_improvement=Brier_Macro-Brier_Macro_Financial) %>%
+    select(horizon,model,AUC_gain,F1_gain,Balanced_Accuracy_gain,Brier_improvement)
+}
+#Results
+nb_financial_comparison <- compare_financial(nb_evaluation_results)
+kable(nb_financial_comparison,digits=3,caption="Incremental financial-indicator value")
 ```
 
-## 7. Paired moving-block bootstrap for AUC gain
+## 8. Paired moving-block bootstrap for AUC gain
 
-Resample 24-month blocks of forecast origins, preserving matched Macro and Macro + Financial predictions. Percentile intervals are descriptive uncertainty estimates and depend on the chosen block length.
-
-```{r auc-bootstrap}
-block_bootstrap_auc_gain <- function(actual, prob_macro, prob_fin,
-                                     block_length=24L, n_boot=1000L) {
+```{r bootstrap-functions}
+block_bootstrap_auc_gain <- function(actual,prob_macro,prob_fin,block_length=24L,n_boot=1000L) {
+  #No. of Blocks
   n <- length(actual)
-  if (n < block_length) stop("Block length exceeds test sample")
-  n_blocks <- ceiling(n/block_length)
-  auc_for <- function(y,p) as.numeric(pROC::auc(
-    pROC::roc(y,p,levels=c(0,1),direction="<",quiet=TRUE)))
+  if (n<block_length) stop("Block length exceeds sample size")
+  n_blocks <- ceiling(n/block_length) #ensures enough obs
+  #Re-sampling
   gains <- replicate(n_boot, {
-    starts <- sample.int(n-block_length+1L, n_blocks, replace=TRUE)
-    idx <- unlist(lapply(starts, function(s) seq.int(s,s+block_length-1L)))[seq_len(n)]
+    starts <- sample.int(n-block_length+1L,n_blocks,replace=TRUE)
+    idx <- unlist(lapply(starts,function(s) seq.int(s,s+block_length-1L)))[seq_len(n)]
+    #Calculate AUC improvement for each sample
     y <- actual[idx]
     if (length(unique(y))<2L) NA_real_ else
-      auc_for(y,prob_fin[idx])-auc_for(y,prob_macro[idx])
+      calculate_auc(y,prob_fin[idx])-calculate_auc(y,prob_macro[idx])
   })
-  observed <- auc_for(actual,prob_fin)-auc_for(actual,prob_macro)
-  if (!any(is.finite(gains))) stop("No valid bootstrap samples")
-  data.frame(AUC_gain=observed,
+  if (!any(is.finite(gains))) stop("No valid bootstrap resamples")
+  #confidence interval construction
+  data.frame(AUC_gain=calculate_auc(actual,prob_fin)-calculate_auc(actual,prob_macro),
              CI_lower=unname(quantile(gains,.025,na.rm=TRUE)),
              CI_upper=unname(quantile(gains,.975,na.rm=TRUE)),
              valid_resamples=sum(is.finite(gains)))
 }
-
-# Check that both datasets have the same outcomes for each forecast date.
-actual_check <- nb_forecast_results %>%
-  group_by(sasdate,horizon) %>%
-  summarise(n_datasets=n_distinct(dataset), n_actual=n_distinct(actual), .groups="drop")
-stopifnot(all(actual_check$n_datasets==2L), all(actual_check$n_actual==1L))
-
-paired <- nb_forecast_results %>%
-  select(sasdate,horizon,dataset,actual,predicted_prob) %>%
-  pivot_wider(names_from=dataset, values_from=predicted_prob) %>%
-  arrange(horizon,sasdate)
-stopifnot(!anyNA(paired$Macro), !anyNA(paired$Macro_Financial))
-set.seed(1213)
-nb_auc_gain_ci <- paired %>%
-  group_by(horizon) %>%
-  group_modify(~block_bootstrap_auc_gain(.x$actual,.x$Macro,.x$Macro_Financial)) %>%
-  ungroup() %>%
-  mutate(significant=CI_lower>0 | CI_upper<0)
-kable(nb_auc_gain_ci,digits=3,caption="Paired block-bootstrap AUC gain (95% intervals)")
+paired_financial <- function(forecasts) {
+  paired <- forecasts %>%
+    select(sasdate,horizon,model,dataset,actual,predicted_prob) %>%
+    pivot_wider(names_from=dataset,values_from=c(actual,predicted_prob)) %>%
+    arrange(horizon,model,sasdate)
+  stopifnot(!anyNA(paired$actual_Macro),!anyNA(paired$actual_Macro_Financial),
+            !anyNA(paired$predicted_prob_Macro),!anyNA(paired$predicted_prob_Macro_Financial),
+            all(paired$actual_Macro==paired$actual_Macro_Financial))
+  paired
+}
+#bootstrap per horizon
+bootstrap_financial <- function(forecasts) {
+  paired <- paired_financial(forecasts)
+  paired %>% group_by(horizon,model) %>%
+    group_modify(~block_bootstrap_auc_gain(.x$actual_Macro,
+                                          .x$predicted_prob_Macro,
+                                          .x$predicted_prob_Macro_Financial)) %>%
+    ungroup() %>% mutate(significant=CI_lower>0 | CI_upper<0)
+}
 ```
 
-## 8. ROC curves
+```{r auc-bootstrap}
+set.seed(1213)
+nb_auc_gain_ci <- bootstrap_financial(nb_forecast_results)
+kable(nb_auc_gain_ci,digits=3,caption="Baseline AUC gains: paired 24-month block bootstrap")
+```
+
+## 9. Recession-by-recession evaluation
+
+```{r recession-episodes}
+#find recession start dates
+test_start <- as.Date("1986-01-01")
+test_recessions <- macro %>% arrange(sasdate) %>%
+  filter(USREC==1,lag(USREC,default=0)==0,sasdate>=test_start) %>% pull(sasdate)
+#no. of months between forecast and actually onset
+month_diff <- function(a,b) {
+  (as.integer(format(b,"%Y"))-as.integer(format(a,"%Y")))*12L +
+    as.integer(format(b,"%m"))-as.integer(format(a,"%m"))
+}
+#matching episodes
+recession_signals <- nb_forecast_results %>%
+  tidyr::crossing(recession_start=test_recessions) %>%
+  mutate(months_before=month_diff(sasdate,recession_start)) %>%
+  filter(months_before>=1L,months_before<=horizon) %>%
+  group_by(dataset,horizon,model,recession_start) %>%
+  summarise(max_prob=max(predicted_prob),flagged=any(predicted_prob>=0.5),
+            earliest_warning_months=if (any(predicted_prob>=0.5)) #no. of months before onset the first qualifying warning occurred
+              max(months_before[predicted_prob>=0.5]) else NA_integer_,.groups="drop")
+kable(recession_signals,digits=3,caption="Warnings before recession onsets")
+#Results
+recession_summary <- recession_signals %>% group_by(dataset,horizon,model) %>%
+  summarise(recessions_flagged=sum(flagged),total_recessions=n(),.groups="drop") %>%
+  left_join(nb_forecast_results %>% group_by(dataset,horizon,model) %>%
+              summarise(false_alarm_months=sum(predicted_prob>=0.5 & actual==0),.groups="drop"),
+            by=c("dataset","horizon","model"))
+kable(recession_summary,caption="Recession detection and false-positive months")
+```
+
+## 10. ROC curves
 
 ```{r roc-curves, fig.width=8, fig.height=5}
 for (h in horizons) {
-  horizon_data <- nb_forecast_results %>% filter(horizon==h)
-  curves <- lapply(split(horizon_data,horizon_data$dataset), function(d) {
-    pROC::roc(d$actual,d$predicted_prob,levels=c(0,1),direction="<",quiet=TRUE)
-  })
-  print(pROC::ggroc(curves, legacy.axes=TRUE) +
+  d <- nb_forecast_results %>% filter(horizon==h)
+  curves <- lapply(split(d,d$dataset),function(z)
+    pROC::roc(z$actual,z$predicted_prob,levels=c(0,1),direction="<",quiet=TRUE))
+  print(pROC::ggroc(curves,legacy.axes=TRUE) +
           geom_abline(slope=1,intercept=0,linetype="dashed",color="grey50") +
           labs(title=paste0("Naive Bayes ROC: ",h,"-month horizon"),
-               x="False positive rate",y="True positive rate",color="Dataset") +
-          theme_minimal())
+               x="False positive rate",y="True positive rate",color="Dataset") + theme_minimal())
 }
+```
+
+## 11. Extension: selected lagged predictors
+
+```{r lagged-data}
+#Define lags
+lag_spec <- list(UNRATE=c(3L,6L),PAYEMS=c(3L,6L),CPIAUCSL=c(3L,6L),
+                 HOUST=c(3L,6L),S_P_500=c(3L,6L),T10YFFM=c(6L,12L))
+add_selected_lags <- function(df,lag_spec) {
+  df <- arrange(df,sasdate)
+  for (variable in names(lag_spec)) {
+    if (!variable %in% names(df)) next
+    for (k in lag_spec[[variable]]) {
+      df[[paste0(variable,"_lag",k)]] <- dplyr::lag(df[[variable]],k)
+    }
+  }
+  df
+}
+#Add lags
+macro_lagged <- add_selected_lags(macro_model,lag_spec)
+macro_fin_lagged <- add_selected_lags(macro_fin_model,lag_spec)
+lag_start <- macro_model$sasdate[13L] #remove the first 12m since longest lag is 12m to ensure lagged datasets starts on the same date
+macro_lagged <- macro_lagged %>% filter(sasdate>=lag_start)
+macro_fin_lagged <- macro_fin_lagged %>% filter(sasdate>=lag_start)
+#verify identical
+stopifnot(identical(macro_lagged$sasdate,macro_fin_lagged$sasdate))
+```
+
+```{r lagged-forecasts}
+#Run models
+datasets_lagged <- list(Macro=macro_lagged,Macro_Financial=macro_fin_lagged)
+nb_forecast_results_lagged <- run_nb_models(datasets_lagged,horizons)
+nb_evaluation_results_lagged <- nb_forecast_results_lagged %>%
+  group_by(dataset,horizon,model) %>% group_modify(~evaluate_forecasts(.x)) %>% ungroup()
+kable(nb_evaluation_results_lagged,digits=3,caption="Lagged Naive Bayes performance")
+```
+
+```{r lagged-financial-comparison}
+#Comparison
+nb_financial_comparison_lagged <- compare_financial(nb_evaluation_results_lagged)
+kable(nb_financial_comparison_lagged,digits=3,caption="Financial-indicator gains with lagged predictors")
+```
+
+```{r lagged-financial-bootstrap}
+#bootstrap to compare between macro only and macro + fin
+set.seed(1213)
+nb_auc_gain_ci_lagged <- bootstrap_financial(nb_forecast_results_lagged)
+kable(nb_auc_gain_ci_lagged,digits=3,caption="Lagged-model financial AUC gains: paired block bootstrap")
+```
+
+## 12. Baseline versus lagged predictors
+
+```{r lag-comparison}
+#match predictions
+paired_lag <- nb_forecast_results %>%
+  select(sasdate,horizon,model,dataset,actual,prob_original=predicted_prob) %>%
+  inner_join(nb_forecast_results_lagged %>%
+               select(sasdate,horizon,model,dataset,actual,prob_lagged=predicted_prob),
+             by=c("sasdate","horizon","model","dataset","actual")) %>%
+  arrange(dataset,horizon,sasdate)
+stopifnot(nrow(paired_lag)==nrow(nb_forecast_results), #verify matched
+          nrow(paired_lag)==nrow(nb_forecast_results_lagged))
+nb_lag_performance <- paired_lag %>% group_by(dataset,horizon,model) %>%
+  group_modify(~{
+    original <- evaluate_forecasts(data.frame(actual=.x$actual,predicted_prob=.x$prob_original))
+    lagged <- evaluate_forecasts(data.frame(actual=.x$actual,predicted_prob=.x$prob_lagged))
+    data.frame(n_paired=nrow(.x),AUC_original=original$AUC,AUC_lagged=lagged$AUC,
+               AUC_change=lagged$AUC-original$AUC,
+               Brier_original=original$Brier,Brier_lagged=lagged$Brier,
+               Brier_improvement=original$Brier-lagged$Brier)
+  }) %>% ungroup()
+kable(nb_lag_performance,digits=3,caption="Baseline versus lagged predictors on matched test months")
+```
+
+```{r lag-bootstrap}
+#bootstrap to compare baseline vs lagged
+set.seed(1213)
+nb_lag_gain_ci <- paired_lag %>% group_by(dataset,horizon,model) %>%
+  group_modify(~block_bootstrap_auc_gain(.x$actual,.x$prob_original,.x$prob_lagged)) %>%
+  ungroup() %>% rename(AUC_change=AUC_gain) %>%
+  mutate(significant=CI_lower>0 | CI_upper<0)
+kable(nb_lag_gain_ci,digits=3,caption="Lagged versus baseline AUC: paired block bootstrap")
 ```
