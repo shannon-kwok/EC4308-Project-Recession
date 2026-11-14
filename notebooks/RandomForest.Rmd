@@ -722,7 +722,7 @@ print(lag_gain_ci, n = Inf)
 This section checks if Random Forest performs better than the Probit model, and whether the gap is significance. This is only tested for macro + financial predictors at the 12 month horizon, since adding financial predictors was established to be significant at only the 12 month horizon for both RF and Probit. This model comparison is done for both the original model, as well as the extended lagged predictor model.
 
 ```{r rf-vs-probit, cache=TRUE}
-# AUC with a fixed direction: higher probability = recession
+# AUC with a fixed direction
 auc_fixed <- function(y, p) {
   as.numeric(auc(roc(y, p, levels = c(0, 1), direction = "<", quiet = TRUE)))
 }
@@ -735,7 +735,7 @@ bootstrap_auc_diff <- function(actual, prob_a, prob_b, block_length = 24, n_boot
     starts <- sample(1:(n - block_length + 1), n_blocks, replace = TRUE)
     idx <- unlist(lapply(starts, function(s) s:(s + block_length - 1)))[1:n]
     y <- actual[idx]
-    if (length(unique(y)) < 2) return(NA_real_)   # resample with no recession: skip
+    if (length(unique(y)) < 2) return(NA_real_) 
     auc_fixed(y, prob_a[idx]) - auc_fixed(y, prob_b[idx])
   })
   data.frame(
@@ -758,6 +758,7 @@ compare_rf_probit <- function(rf_results, probit_results, label) {
     filter(model == "Probit", dataset == "Macro_Financial", horizon == 12,
            is.finite(predicted_prob)) %>%
     select(sasdate, actual_probit = actual, prob_probit = predicted_prob)
+  stopifnot(!anyDuplicated(pr$sasdate))   
   paired <- inner_join(rf, pr, by = "sasdate") %>% arrange(sasdate)
   stopifnot(all(paired$actual == paired$actual_probit))   # same outcomes on matched months
   bootstrap_auc_diff(paired$actual, paired$prob_rf, paired$prob_probit) %>%
@@ -768,18 +769,19 @@ probit_results <- read_csv("../results/static_probit_logit_forecasts.csv", show_
   mutate(sasdate = as.Date(sasdate))
 
 probit_lagged_file <- "../results/static_probit_logit_forecasts_lagged.csv"
-probit_results_lagged <- if (file.exists(probit_lagged_file)) {
-  read_csv(probit_lagged_file, show_col_types = FALSE) %>% mutate(sasdate = as.Date(sasdate))
-} else NULL
+if (!file.exists(probit_lagged_file)) {
+  stop("Lagged probit forecasts not found: re-run baseline models.Rmd so it saves ", probit_lagged_file)
+}
+probit_results_lagged <- read_csv(probit_lagged_file, show_col_types = FALSE) %>%
+  mutate(sasdate = as.Date(sasdate))
 
 set.seed(1213)
 rf_vs_probit <- bind_rows(
   compare_rf_probit(rf_forecast_results, probit_results, "RF vs Probit (original)"),
-  compare_rf_probit(rf_forecast_results_lagged, probit_results, "RF lagged vs Probit (original)"),
-  if (!is.null(probit_results_lagged))
-    compare_rf_probit(rf_forecast_results_lagged, probit_results_lagged, "RF lagged vs Probit lagged")
+  compare_rf_probit(rf_forecast_results_lagged, probit_results_lagged, "RF lagged vs Probit lagged")
 ) %>%
   mutate(significant = CI_lower > 0 | CI_upper < 0)
 
 print(rf_vs_probit, digits = 3)
 ```
+
