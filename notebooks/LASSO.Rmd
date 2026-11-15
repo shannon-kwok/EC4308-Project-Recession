@@ -724,3 +724,103 @@ print(lag_performance, n = Inf)
 
 ```
 
+# Comparison of Post-LASSO model to Benchmark Probit Model
+
+1. Load Probit Results
+```{r}
+# Load Probit forecasts
+probit_results <- read_csv("../results/static_probit_logit_forecasts.csv",show_col_types = FALSE) %>%
+  mutate(sasdate = as.Date(sasdate))
+
+# Load lagged Probit forecasts
+probit_results_lagged <- read_csv("../results/static_probit_logit_forecasts_lagged.csv",show_col_types = FALSE) %>%
+  mutate(sasdate = as.Date(sasdate))
+```
+
+2. Block Bootstrap Function 
+
+```{r}
+# Post-LASSO vs Probit: 12-month horizon, Macro + Financial
+
+compare_postlasso_probit <- function(lasso_results, probit_results, label) {
+
+  # Post-LASSO predictions
+  pl <- lasso_results %>%
+    filter(
+      model == "Post-LASSO",
+      dataset == "Macro_Financial",
+      horizon == 12
+    ) %>%
+    select(sasdate, actual, prob_postlasso = predicted_prob)
+
+  # Probit predictions
+  pr <- probit_results %>%
+    filter(
+      model == "Probit",
+      dataset == "Macro_Financial",
+      horizon == 12,
+      is.finite(predicted_prob)
+    ) %>%
+    select(
+      sasdate,
+      actual_probit = actual,
+      prob_probit = predicted_prob
+    )
+
+  # Check for duplicate dates
+  stopifnot(
+    !anyDuplicated(pl$sasdate),
+    !anyDuplicated(pr$sasdate)
+  )
+
+  # Match forecasts on identical dates
+  paired <- inner_join(pl, pr, by = "sasdate") %>%
+    arrange(sasdate)
+
+  # Verify targets match
+  stopifnot(
+    nrow(paired) > 24,
+    all(paired$actual == paired$actual_probit)
+  )
+
+  # Paired block bootstrap
+  result <- block_bootstrap_auc_gain(
+    actual = paired$actual,
+    prob_macro = paired$prob_probit,
+    prob_fin = paired$prob_postlasso,
+    block_length = 24,
+    n_boot = 1000
+  )
+
+  result %>%
+    mutate(
+      comparison = label,
+      n_months = nrow(paired),
+      significant = CI_lower > 0 | CI_upper < 0,
+      .before = 1
+    ) %>%
+    rename(AUC_diff = AUC_gain)
+}
+```
+
+# 3. Run the function for both original and lagged models
+
+```{r}
+set.seed(1213)
+postlasso_vs_probit <- bind_rows(
+  compare_postlasso_probit(
+    forecast_results,
+    probit_results,
+    "Post-LASSO vs Probit (original)"
+  ),
+  compare_postlasso_probit(
+    forecast_results_lagged,
+    probit_results_lagged,
+    "Post-LASSO lagged vs Probit lagged"
+  )
+)
+
+print(postlasso_vs_probit, digits = 3)
+
+```
+
