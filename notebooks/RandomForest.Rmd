@@ -727,7 +727,7 @@ auc_fixed <- function(y, p) {
   as.numeric(auc(roc(y, p, levels = c(0, 1), direction = "<", quiet = TRUE)))
 }
 
-# paired moving-block bootstrap of AUC(model A) - AUC(model B) on the same months
+# paired block bootstrap of AUC(model A) - AUC(model B) on the same months
 bootstrap_auc_diff <- function(actual, prob_a, prob_b, block_length = 24, n_boot = 1000) {
   n <- length(actual)
   n_blocks <- ceiling(n / block_length)
