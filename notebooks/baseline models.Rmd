@@ -434,6 +434,7 @@ run_binary_models <- function(datasets) {
 
 datasets_lagged <- list(Macro = macro_lagged, Macro_Financial = macro_fin_lagged)
 forecast_results_lagged <- run_binary_models(datasets_lagged)
+write_csv(forecast_results_lagged, "../results/static_probit_logit_forecasts_lagged.csv")
 
 forecast_results_lagged %>% group_by(dataset, horizon, model) %>%
   summarise(test_rows = n(), valid_forecasts = sum(is.finite(predicted_prob)),
