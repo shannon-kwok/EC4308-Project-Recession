@@ -18,6 +18,7 @@ library(hdm)
 library(pROC)
 library(knitr)
 library(tidyr)
+library(lubridate)
 set.seed(1213)
 
 ```
@@ -47,7 +48,7 @@ sum(is.na(macro))
 sum(is.na(macro_fin))
 ```
 
-#3. EDA; Checking of recessions (can move to seperate Rmd downstream)
+#3. Checking of recessions 
 ```{r}
 recession_data <- macro_fin %>%
   select(sasdate, USREC) %>%
@@ -204,7 +205,7 @@ sum(is.na(macro_fin_model[predictor_cols_fin]))
 ```
 
 #7. LASSO model 
-reusable function - have to think about the announcement delays from NBER, as mentioned by prof, this assumption may introduce lookahead bias... can consider incorporating announcement delays into model specification (18 months following Davig and Hall),, so like restruct training observations to those at least h + 18 months before forecast origin
+
 ```{r}
 fit_lasso <- function(train_data, horizon, post=FALSE) {
   target <- paste0("Y_", horizon)
@@ -351,7 +352,6 @@ forecast_results %>%
     .groups = "drop"
   )
 ```
-## POINT TO NOTE (TO ADD IN REPORT) Across all LASSO specifications and forecast horizons, the models produce an extremely confident false positive in April 2020. This may reflect the exceptional nature of the COVID-19 recession, which lasted only two months. Historically, severe deteriorations in macroeconomic conditions are associated with more persistent recessions, potentially leading the models to overestimate future recession risk. Furthermore, because the target variable captures recession occurrence strictly after the forecast-origin month, April 2020 is classified as a non-recession outcome despite being a recessionary month itself. This illustrates the sensitivity of recession forecasting to both unusual economic shocks and the definition of the forecasting target.
 
 # 9. Evaluation of results
 
@@ -420,6 +420,7 @@ financial_comparison <- evaluation_results %>%
 
 print(financial_comparison, n = Inf)
 ```
+
 # 10.  Statistical significance of AUC improvements through block bootstrap (adapted from random forest analysis)
 
 ```{r}
@@ -489,7 +490,60 @@ lasso_auc_ci <- paired_forecasts %>%
 
 print(lasso_auc_ci, n=Inf)
 ```
-## Extension: LASSO with Selected Lagged Predictors according to Economic Intuition
+
+Cleaned LASSO results report
+```{r}
+# Combine performance gains with bootstrap confidence intervals
+lasso_report <- financial_comparison %>%
+  left_join(
+    lasso_auc_ci %>%
+      select(horizon, model, CI_lower, CI_upper, significant),
+    by = c("horizon", "model")
+  ) %>%
+  mutate(
+    Horizon = paste0(horizon, "m"),
+    `AUC Gain` = sprintf("%+.3f", AUC_gain),
+    `95% CI` = sprintf("[%.3f, %.3f]", CI_lower, CI_upper),
+    `Brier Gain` = sprintf("%+.3f", Brier_improvement),
+    `F1 Gain` = sprintf("%+.3f", F1_gain),
+    `Balanced Accuracy Gain` =
+      sprintf("%+.3f", Balanced_Accuracy_gain),
+    `Significant` = ifelse(significant, "Yes", "No")
+  ) %>%
+  select(
+    Model = model,
+    Horizon,
+    `AUC Gain`,
+    `95% CI`,
+    `Brier Gain`,
+    `F1 Gain`,
+    `Balanced Accuracy Gain`,
+    Significant
+  )
+
+knitr::kable(
+  lasso_report,
+  caption = "Incremental Predictive Performance of Financial Indicators"
+)
+
+# Standard LASSO
+lasso_report %>%
+  filter(Model == "LASSO") %>%
+  select(-Model) %>%
+  knitr::kable(
+    caption = "Standard LASSO: Incremental Predictive Performance"
+  )
+
+# Post-LASSO
+lasso_report %>%
+  filter(Model == "Post-LASSO") %>%
+  select(-Model) %>%
+  knitr::kable(
+    caption = "Post-LASSO: Incremental Predictive Performance"
+  )
+```
+
+## Extension: LASSO with Longer Selected Lagged Predictors according to Economic Intuition
 
 1. Define lag specifications and add lag predictors
 
@@ -559,7 +613,6 @@ print(evaluation_results_lagged, n=Inf)
 
 4. Macro and Macro-Financial Comparison
 
-#codes are in chunk since i did not make my previous functions reusable oops
 ```{r}
 financial_comparison_lagged <- evaluation_results_lagged %>%
   select(dataset, horizon, model, AUC, F1,
@@ -587,7 +640,7 @@ print(financial_comparison_lagged, n = Inf)
 5. Statistical significance of AUC gains through block bootstrap
 
 ```{r}
-
+set.seed(1213)
 # Pair Macro and Macro + Financial predictions
 paired_forecasts_lagged <- forecast_results_lagged %>%
   select(sasdate, horizon, model, dataset,
@@ -668,6 +721,106 @@ lag_performance <- paired_lag %>%
   ungroup()
 
 print(lag_performance, n = Inf)
+
+```
+
+# Comparison of Post-LASSO model to Benchmark Probit Model
+
+1. Load Probit Results
+```{r}
+# Load Probit forecasts
+probit_results <- read_csv("../results/static_probit_logit_forecasts.csv",show_col_types = FALSE) %>%
+  mutate(sasdate = as.Date(sasdate))
+
+# Load lagged Probit forecasts
+probit_results_lagged <- read_csv("../results/static_probit_logit_forecasts_lagged.csv",show_col_types = FALSE) %>%
+  mutate(sasdate = as.Date(sasdate))
+```
+
+2. Block Bootstrap Function 
+
+```{r}
+# Post-LASSO vs Probit: 12-month horizon, Macro + Financial
+
+compare_postlasso_probit <- function(lasso_results, probit_results, label) {
+
+  # Post-LASSO predictions
+  pl <- lasso_results %>%
+    filter(
+      model == "Post-LASSO",
+      dataset == "Macro_Financial",
+      horizon == 12
+    ) %>%
+    select(sasdate, actual, prob_postlasso = predicted_prob)
+
+  # Probit predictions
+  pr <- probit_results %>%
+    filter(
+      model == "Probit",
+      dataset == "Macro_Financial",
+      horizon == 12,
+      is.finite(predicted_prob)
+    ) %>%
+    select(
+      sasdate,
+      actual_probit = actual,
+      prob_probit = predicted_prob
+    )
+
+  # Check for duplicate dates
+  stopifnot(
+    !anyDuplicated(pl$sasdate),
+    !anyDuplicated(pr$sasdate)
+  )
+
+  # Match forecasts on identical dates
+  paired <- inner_join(pl, pr, by = "sasdate") %>%
+    arrange(sasdate)
+
+  # Verify targets match
+  stopifnot(
+    nrow(paired) > 24,
+    all(paired$actual == paired$actual_probit)
+  )
+
+  # Paired block bootstrap
+  result <- block_bootstrap_auc_gain(
+    actual = paired$actual,
+    prob_macro = paired$prob_probit,
+    prob_fin = paired$prob_postlasso,
+    block_length = 24,
+    n_boot = 1000
+  )
+
+  result %>%
+    mutate(
+      comparison = label,
+      n_months = nrow(paired),
+      significant = CI_lower > 0 | CI_upper < 0,
+      .before = 1
+    ) %>%
+    rename(AUC_diff = AUC_gain)
+}
+```
+
+# 3. Run the function for both original and lagged models
+
+```{r}
+set.seed(1213)
+postlasso_vs_probit <- bind_rows(
+  compare_postlasso_probit(
+    forecast_results,
+    probit_results,
+    "Post-LASSO vs Probit (original)"
+  ),
+  compare_postlasso_probit(
+    forecast_results_lagged,
+    probit_results_lagged,
+    "Post-LASSO lagged vs Probit lagged"
+  )
+)
+
+print(postlasso_vs_probit, digits = 3)
 
 ```
 
