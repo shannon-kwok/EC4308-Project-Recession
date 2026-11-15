@@ -587,7 +587,7 @@ print(financial_comparison_lagged, n = Inf)
 5. Statistical significance of AUC gains through block bootstrap
 
 ```{r}
-
+set.seed(1213)
 # Pair Macro and Macro + Financial predictions
 paired_forecasts_lagged <- forecast_results_lagged %>%
   select(sasdate, horizon, model, dataset,
