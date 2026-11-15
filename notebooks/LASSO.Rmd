@@ -491,58 +491,6 @@ lasso_auc_ci <- paired_forecasts %>%
 print(lasso_auc_ci, n=Inf)
 ```
 
-Cleaned LASSO results report
-```{r}
-# Combine performance gains with bootstrap confidence intervals
-lasso_report <- financial_comparison %>%
-  left_join(
-    lasso_auc_ci %>%
-      select(horizon, model, CI_lower, CI_upper, significant),
-    by = c("horizon", "model")
-  ) %>%
-  mutate(
-    Horizon = paste0(horizon, "m"),
-    `AUC Gain` = sprintf("%+.3f", AUC_gain),
-    `95% CI` = sprintf("[%.3f, %.3f]", CI_lower, CI_upper),
-    `Brier Gain` = sprintf("%+.3f", Brier_improvement),
-    `F1 Gain` = sprintf("%+.3f", F1_gain),
-    `Balanced Accuracy Gain` =
-      sprintf("%+.3f", Balanced_Accuracy_gain),
-    `Significant` = ifelse(significant, "Yes", "No")
-  ) %>%
-  select(
-    Model = model,
-    Horizon,
-    `AUC Gain`,
-    `95% CI`,
-    `Brier Gain`,
-    `F1 Gain`,
-    `Balanced Accuracy Gain`,
-    Significant
-  )
-
-knitr::kable(
-  lasso_report,
-  caption = "Incremental Predictive Performance of Financial Indicators"
-)
-
-# Standard LASSO
-lasso_report %>%
-  filter(Model == "LASSO") %>%
-  select(-Model) %>%
-  knitr::kable(
-    caption = "Standard LASSO: Incremental Predictive Performance"
-  )
-
-# Post-LASSO
-lasso_report %>%
-  filter(Model == "Post-LASSO") %>%
-  select(-Model) %>%
-  knitr::kable(
-    caption = "Post-LASSO: Incremental Predictive Performance"
-  )
-```
-
 ## Extension: LASSO with Longer Selected Lagged Predictors according to Economic Intuition
 
 1. Define lag specifications and add lag predictors
@@ -658,7 +606,7 @@ stopifnot(
       paired_forecasts_lagged$actual_Macro_Financial)
 )
 
-# Paired moving-block bootstrap
+# block bootstrap
 set.seed(1213)
 
 lasso_auc_ci_lagged <- paired_forecasts_lagged %>%
