@@ -54,41 +54,12 @@ create_targets <- function(df) {
   }
   df
 }
-macro <- create_targets(macro)
-macro_fin <- create_targets(macro_fin)
+macro_model <- create_targets(macro)
+macro_fin_model <- create_targets(macro_fin)
 ```
 
-## 3. Forward-fill for missing values
 
-```{r forward-fill}
-predictor_cols <- setdiff(
-  names(macro),
-  c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
-)
-# forward fill function
-forward_fill <- function(df) {
-  predictor_cols <- setdiff(
-    names(df),
-    c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
-  )
-  df %>%
-    arrange(sasdate) %>%
-    fill(all_of(predictor_cols), .direction = "down")
-}
-
-macro_model <- forward_fill(macro)
-macro_fin_model <- forward_fill(macro_fin)
-
-# check if missing values still exist
-sum(is.na(macro_model[predictor_cols]))
-predictor_cols_fin <- setdiff(
-  names(macro_fin_model),
-  c("sasdate", "USREC", "Y_3", "Y_6", "Y_12", "sample")
-)
-sum(is.na(macro_fin_model[predictor_cols_fin]))
-```
-
-## 4. Gaussian Naive Bayes functions
+## 3. Gaussian Naive Bayes functions
 
 ```{r nb-functions}
 
@@ -110,7 +81,7 @@ predict_nb <- function(fitted, newdata) {
 
 ```
 
-## 5. Monthly expanding-window forecasts
+## 4. Monthly expanding-window forecasts
 
 ```{r forecast-function}
 
@@ -179,7 +150,7 @@ nb_forecast_results %>% group_by(dataset,horizon) %>%
   kable(digits=3,caption="Out-of-sample forecast coverage")
 ```
 
-## 6. Evaluation
+## 5. Evaluation
 
 AUC uses a fixed ROC direction; F1 and balanced accuracy use a classification threshold of 0.50.
 
@@ -209,7 +180,7 @@ nb_evaluation_results <- nb_forecast_results %>%
 kable(nb_evaluation_results,digits=3,caption="Baseline Naive Bayes performance")
 ```
 
-## 7. Incremental value of financial indicators
+## 6. Incremental value of financial indicators
 
 ```{r financial-comparison}
 compare_financial <- function(evaluations) {
@@ -227,7 +198,7 @@ nb_financial_comparison <- compare_financial(nb_evaluation_results)
 kable(nb_financial_comparison,digits=3,caption="Incremental financial-indicator value")
 ```
 
-## 8. Paired moving-block bootstrap for AUC gain
+## 7. Paired moving-block bootstrap for AUC gain
 
 ```{r bootstrap-functions}
 block_bootstrap_auc_gain <- function(actual,prob_macro,prob_fin,block_length=24L,n_boot=1000L) {
@@ -278,7 +249,7 @@ nb_auc_gain_ci <- bootstrap_financial(nb_forecast_results)
 kable(nb_auc_gain_ci,digits=3,caption="Baseline AUC gains: paired 24-month block bootstrap")
 ```
 
-## 9. Recession-by-recession evaluation
+## 8. Recession-by-recession evaluation
 
 ```{r recession-episodes}
 #find recession start dates
@@ -309,7 +280,7 @@ recession_summary <- recession_signals %>% group_by(dataset,horizon,model) %>%
 kable(recession_summary,caption="Recession detection and false-positive months")
 ```
 
-## 10. ROC curves
+## 9. ROC curves
 
 ```{r roc-curves, fig.width=8, fig.height=5}
 for (h in horizons) {
@@ -323,7 +294,7 @@ for (h in horizons) {
 }
 ```
 
-## 11. Extension: selected lagged predictors
+## 10. Extension: selected lagged predictors
 
 ```{r lagged-data}
 #Define lags
@@ -371,7 +342,7 @@ nb_auc_gain_ci_lagged <- bootstrap_financial(nb_forecast_results_lagged)
 kable(nb_auc_gain_ci_lagged,digits=3,caption="Lagged-model financial AUC gains: paired block bootstrap")
 ```
 
-## 12. Baseline versus lagged predictors
+## 11. Baseline versus lagged predictors
 
 ```{r lag-comparison}
 #match predictions
@@ -403,4 +374,77 @@ nb_lag_gain_ci <- paired_lag %>% group_by(dataset,horizon,model) %>%
   ungroup() %>% rename(AUC_change=AUC_gain) %>%
   mutate(significant=CI_lower>0 | CI_upper<0)
 kable(nb_lag_gain_ci,digits=3,caption="Lagged versus baseline AUC: paired block bootstrap")
+```
+## 12. Naive Bayes vs Probit Benchmark
+
+```{r nb-vs-probit}
+# Compare Naive Bayes and Probit's AUC on identical forecast months.
+#bootstrap function
+bootstrap_nb_probit <- function(actual, prob_nb, prob_probit,
+                                block_length = 24L, n_boot = 1000L) {
+  n <- length(actual) #No. of blocks and to ensure that there are enough obs
+  if (n < block_length) stop("Block length exceeds matched sample size")
+  if (length(unique(actual)) < 2L) stop("Both outcome classes are required")
+  n_blocks <- ceiling(n / block_length)
+
+  diffs <- replicate(n_boot, { #Block bootstrap
+    starts <- sample.int(n - block_length + 1L, n_blocks, replace = TRUE)
+    #Combine sampled blocks
+    idx <- unlist(lapply(starts, function(s) seq.int(s, s + block_length - 1L)))[seq_len(n)]
+    y <- actual[idx]
+    if (length(unique(y)) < 2L) return(NA_real_)
+    calculate_auc(y, prob_nb[idx]) - calculate_auc(y, prob_probit[idx]) #calculate AUC difference
+  })
+
+  auc_nb <- calculate_auc(actual, prob_nb)
+  auc_probit <- calculate_auc(actual, prob_probit)
+  data.frame(
+    n_months = n,
+    AUC_NB = auc_nb,
+    AUC_Probit = auc_probit,
+    AUC_diff = auc_nb - auc_probit,
+    CI_lower = unname(quantile(diffs, 0.025, na.rm = TRUE)), #CI intervals
+    CI_upper = unname(quantile(diffs, 0.975, na.rm = TRUE)),
+    valid_resamples = sum(is.finite(diffs))
+  )
+}
+
+compare_nb_probit <- function(nb_results, probit_results, label) { #function to compare both models
+  nb <- nb_results %>%
+    filter(model == "Naive Bayes", dataset == "Macro_Financial", horizon == 12) %>%
+    select(sasdate, actual, prob_nb = predicted_prob)
+
+  pr <- probit_results %>%
+    filter(model == "Probit", dataset == "Macro_Financial", horizon == 12) %>%
+    select(sasdate, actual_probit = actual, prob_probit = predicted_prob)
+
+  paired <- inner_join(nb, pr, by = "sasdate") %>% #match them by date for comparison
+    filter(is.finite(prob_nb), is.finite(prob_probit),
+           !is.na(actual), !is.na(actual_probit)) %>%
+    arrange(sasdate)
+
+  bootstrap_nb_probit(paired$actual, paired$prob_nb, paired$prob_probit) %>%
+    mutate(comparison = label, .before = 1)
+}
+
+# Load Probit forecasts
+probit_file <- "../results/static_probit_logit_forecasts.csv"
+probit_lagged_file <- "../results/static_probit_logit_forecasts_lagged.csv"
+
+probit_results <- read_csv(probit_file, show_col_types = FALSE) %>%
+  mutate(sasdate = as.Date(sasdate))
+probit_results_lagged <- read_csv(probit_lagged_file, show_col_types = FALSE) %>%
+  mutate(sasdate = as.Date(sasdate))
+
+set.seed(1213)
+nb_vs_probit <- bind_rows(
+  compare_nb_probit(nb_forecast_results, probit_results,
+                    "Naive Bayes vs Probit"),
+  compare_nb_probit(nb_forecast_results_lagged, probit_results_lagged,
+                    "Naive Bayes lagged vs Probit lagged")
+) %>%
+  mutate(significant = CI_lower > 0 | CI_upper < 0)
+
+kable(nb_vs_probit, digits = 3,
+      caption = "Naive Bayes vs Probit: paired 24-month block bootstrap")
 ```
