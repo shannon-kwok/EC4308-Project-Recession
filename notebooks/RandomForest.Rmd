@@ -312,8 +312,8 @@ block_bootstrap_auc_gain <- function(actual, prob_macro, prob_fin,
     idx <- unlist(lapply(starts, function(s) s:(s + block_length - 1)))[1:n]
     y <- actual[idx]
     if (length(unique(y)) < 2) return(NA_real_)   # resample with no recession: skip
-    as.numeric(auc(y, prob_fin[idx], quiet = TRUE)) -
-      as.numeric(auc(y, prob_macro[idx], quiet = TRUE))
+    as.numeric(auc(y, prob_fin[idx], levels = c(0, 1), direction = "<", quiet = TRUE)) -
+      as.numeric(auc(y, prob_macro[idx], levels = c(0, 1), direction = "<", quiet = TRUE))
   })
 
   data.frame(
@@ -519,7 +519,7 @@ for (dataset_name in names(datasets)) {
       f <- forecast_rf(val_df, h, "RF", mtry = m, refit_every = 12, test_start = val_start)
       tuning_results[[paste(dataset_name, h, m, sep = "_")]] <- tibble(
         dataset = dataset_name, horizon = h, mtry = m,
-        val_AUC = as.numeric(auc(f$actual, f$predicted_prob, quiet = TRUE))
+        val_AUC = as.numeric(auc(f$actual, f$predicted_prob, levels = c(0, 1), direction = "<", quiet = TRUE))
       )
     }
   }

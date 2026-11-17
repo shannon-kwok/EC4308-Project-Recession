@@ -1,0 +1,21 @@
+# R packages required to run the notebooks 
+# Install all with:
+#   install.packages(readLines("requirements.txt")[!grepl("^#|^$", readLines("requirements.txt"))])
+
+# Data handling
+dplyr
+tidyr
+readr
+lubridate
+here
+
+# Models
+ranger
+hdm
+e1071
+
+# Evaluation and output
+pROC
+ggplot2
+knitr
+rmarkdown

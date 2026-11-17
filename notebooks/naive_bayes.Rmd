@@ -198,7 +198,7 @@ nb_financial_comparison <- compare_financial(nb_evaluation_results)
 kable(nb_financial_comparison,digits=3,caption="Incremental financial-indicator value")
 ```
 
-## 7. Paired moving-block bootstrap for AUC gain
+## 7. Paired block bootstrap for AUC gain
 
 ```{r bootstrap-functions}
 block_bootstrap_auc_gain <- function(actual,prob_macro,prob_fin,block_length=24L,n_boot=1000L) {
