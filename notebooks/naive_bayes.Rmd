@@ -294,7 +294,7 @@ for (h in horizons) {
 }
 ```
 
-## 10. Extension: selected lagged predictors
+## 10. Extension: selected further lagged predictors
 
 ```{r lagged-data}
 #Define lags
@@ -343,7 +343,7 @@ kable(nb_auc_gain_ci_lagged,digits=3,caption="Lagged-model financial AUC gains: 
 ```
 
 ## 11. Baseline versus lagged predictors
-
+This section is to compare between baseline naive bayes against naive bayes with further lags.
 ```{r lag-comparison}
 #match predictions
 paired_lag <- nb_forecast_results %>%
