@@ -380,7 +380,7 @@ evaluate_forecasts <- function(df, threshold = 0.5) {
   brier <- mean((actual-prob)^2)
   
   #ROC-AUC
-  auc_value <- as.numeric(auc(roc(actual,prob,quiet=TRUE)))
+  auc_value <- as.numeric(pROC::auc(pROC::roc(actual, prob,levels = c(0, 1),direction = "<",quiet = TRUE)))
   data.frame(AUC = auc_value, F1 = f1, Balanced_Accuracy = balanced_accuracy, Brier = brier)
 }
 ```
@@ -669,6 +669,31 @@ lag_performance <- paired_lag %>%
   ungroup()
 
 print(lag_performance, n = Inf)
+
+```
+
+# Comparison of change in model performance after addition of further lagged predictors  through block bootstrapping
+
+```{r}
+set.seed(1213)
+
+lasso_lag_gain_ci <- paired_lag %>%
+  arrange(sasdate) %>%
+  group_by(dataset, horizon, model) %>%
+  group_modify(~ block_bootstrap_auc_gain(
+    actual = .x$actual,
+    prob_macro = .x$prob_original,
+    prob_fin = .x$prob_lagged,
+    block_length = 24,
+    n_boot = 1000
+  )) %>%
+  ungroup() %>%
+  mutate(
+    significant = CI_lower > 0 | CI_upper < 0
+  ) %>%
+  arrange(model, dataset, horizon)
+
+print(lasso_lag_gain_ci, n = Inf)
 
 ```
 

@@ -71,8 +71,6 @@ macro %>%
 
 # 4. Forecast design and diagnostics
 
-The first out-of-sample forecast is January 1986. Each forecast is re-estimated on an expanding window. At forecast origin `t`, we only use training rows whose entire future target window ends before `t`. Set `announcement_delay_months` to 18 for a conservative label-availability sensitivity analysis. Zero is the directly comparable baseline. This does not fix delays in the release or revision of predictors.
-
 ```{r design}
 
 test_start <- as.Date("1986-01-01")
@@ -207,6 +205,7 @@ for (dataset_name in names(datasets)) {
   }
 }
 forecast_results <- bind_rows(all_forecasts)
+write_csv(forecast_results, "../results/static_probit_logit_forecasts.csv")
 
 forecast_results %>% group_by(dataset, horizon, model) %>%
   summarise(test_rows = n(), valid_forecasts = sum(is.finite(predicted_prob)),
@@ -218,7 +217,6 @@ forecast_results %>% group_by(dataset, horizon, model) %>%
 AUC evaluates ranking performance; F1 evaluates binary classification at the pre-specified threshold of 0.5; balanced accuracy and Brier score provide complementary diagnostics. If either class is absent or no valid forecasts exist, the affected metric is `NA`.
 
 ```{r evaluation-functions}
-
 # keep only valid forecasts
 evaluate_forecasts <- function(df, threshold = 0.5) {
   df <- df %>% filter(is.finite(predicted_prob), !is.na(actual))
